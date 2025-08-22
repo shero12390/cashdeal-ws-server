@@ -1,179 +1,96 @@
-// server.js — Cashdeal Multiplayer (Rooms + Shared State + Broadcast)
-// Runtime: Node.js with only "ws" dependency
-// How it works:
-//  - Clients connect via WebSocket
-//  - Join a room with:   {"type":"join","room":"demo1","name":"Alice"}
-//  - Send state updates: {"type":"move","room":"demo1","payload":{"x":100,"y":250,"score":3}}
-//  - Optional chat:      {"type":"chat","room":"demo1","text":"hi"}
-//  - Ping/pong:          {"type":"ping"}
-//  - Leave:              {"type":"leave","room":"demo1"}
-// Server keeps per-room shared state (one entry per player name) and
-// broadcasts updates to everyone in that room (not to other rooms).
-
+// server.js
 const WebSocket = require("ws");
 
 const PORT = process.env.PORT || 3000;
-const wss  = new WebSocket.Server({ port: PORT }, () => {
-  console.log("Cashdeal WS Server running on port", PORT);
-});
+const wss = new WebSocket.Server({ port: PORT });
 
-// In-memory store
-// rooms: Map<roomId, { players: Map<ws, name>, state: Record<name, payload> }>
-const rooms = new Map();
+console.log("Cashdeal WS Server running on port", PORT);
 
-function send(ws, obj) {
-  try { ws.send(typeof obj === "string" ? obj : JSON.stringify(obj)); } catch (_) {}
-}
-
-function ensureRoom(roomId) {
-  if (!rooms.has(roomId)) rooms.set(roomId, { players: new Map(), state: {} });
-  return rooms.get(roomId);
-}
-
-function broadcastRoom(roomId, obj, exceptWS = null) {
-  const room = rooms.get(roomId);
-  if (!room) return;
-  const msg = typeof obj === "string" ? obj : JSON.stringify(obj);
-  for (const client of room.players.keys()) {
-    if (client !== exceptWS && client.readyState === WebSocket.OPEN) {
-      try { client.send(msg); } catch (_) {}
-    }
-  }
-}
-
-function removeFromAllRooms(ws) {
-  for (const [roomId, room] of rooms) {
-    if (room.players.has(ws)) {
-      const name = room.players.get(ws);
-      room.players.delete(ws);
-      delete room.state[name];
-
-      // Notify others and sync state
-      broadcastRoom(roomId, { type: "system", msg: `${name} left`, serverTs: Date.now() });
-      broadcastRoom(roomId, { type: "state", state: room.state, serverTs: Date.now() });
-
-      if (room.players.size === 0) rooms.delete(roomId);
-    }
-  }
-}
+// Keep rooms and players
+let rooms = {};
 
 wss.on("connection", (ws) => {
-  ws.isAlive = true;                    // heartbeat flag
-  ws.displayName = null;                // set after join
-  ws.currentRooms = new Set();          // support multiple rooms if you want
+  console.log("New client connected");
 
-  // greet client
-  send(ws, { type: "hello", msg: "Connected to Cashdeal server", serverTs: Date.now() });
+  ws.on("message", (msg) => {
+    try {
+      const data = JSON.parse(msg);
+      console.log("Received:", data);
 
-  // heartbeat replies
-  ws.on("pong", () => { ws.isAlive = true; });
+      // --- Handle join ---
+      if (data.type === "join") {
+        const { room, name } = data;
+        if (!rooms[room]) rooms[room] = { players: [], state: {} };
+        if (!rooms[room].players.includes(name)) {
+          rooms[room].players.push(name);
+        }
+        ws.room = room;
+        ws.name = name;
 
-  ws.on("message", (raw) => {
-    let msg;
-    try { msg = JSON.parse(raw.toString()); }
-    catch { return send(ws, { type: "error", msg: "Invalid JSON", serverTs: Date.now() }); }
+        // Reply only to the joining client
+        ws.send(JSON.stringify({
+          type: "joined",
+          room,
+          you: name,
+          players: rooms[room].players
+        }));
 
-    const t = msg.type;
-    const now = Date.now();
-
-    // ---- JOIN ROOM ----
-    if (t === "join") {
-      const roomId = String(msg.room || "").trim();
-      const name   = String(msg.name || "").trim() || "Player";
-      if (!roomId) return send(ws, { type: "error", msg: "room required", serverTs: now });
-
-      const room = ensureRoom(roomId);
-      room.players.set(ws, name);
-      ws.displayName = name;
-      ws.currentRooms.add(roomId);
-
-      // Welcome the joiner with roster + current state
-      send(ws, {
-        type: "joined",
-        room: roomId,
-        you: name,
-        players: Array.from(room.players.values()),
-        serverTs: now
-      });
-      send(ws, { type: "state", room: roomId, state: room.state, serverTs: now });
-
-      // Notify others (except the joiner)
-      broadcastRoom(roomId, { type: "system", msg: `${name} joined`, serverTs: now }, ws);
-      return;
-    }
-
-    // ---- LEAVE ROOM ----
-    if (t === "leave") {
-      const roomId = String(msg.room || "").trim();
-      if (!roomId) return send(ws, { type: "error", msg: "room required", serverTs: now });
-
-      const room = rooms.get(roomId);
-      if (!room || !room.players.has(ws)) return;
-
-      const name = room.players.get(ws);
-      room.players.delete(ws);
-      ws.currentRooms.delete(roomId);
-      delete room.state[name];
-
-      broadcastRoom(roomId, { type: "system", msg: `${name} left`, serverTs: now });
-      broadcastRoom(roomId, { type: "state", room: roomId, state: room.state, serverTs: now });
-
-      if (room.players.size === 0) rooms.delete(roomId);
-      return;
-    }
-
-    // ---- MOVE / STATE UPDATE ----
-    if (t === "move") {
-      const roomId = String(msg.room || "").trim();
-      const room = rooms.get(roomId);
-      if (!room || !room.players.has(ws)) {
-        return send(ws, { type: "error", msg: "join first", serverTs: now });
+        // Notify others in the room
+        broadcast(room, {
+          type: "state",
+          room,
+          state: rooms[room].state
+        });
       }
-      const name = room.players.get(ws);
 
-      // payload can be any object: {x,y,score,angle,...}
-      room.state[name] = msg.payload || {};
-      // Broadcast the entire state so all clients render the same view
-      return broadcastRoom(roomId, { type: "state", room: roomId, state: room.state, serverTs: now });
+      // --- Handle moves (game actions) ---
+      else if (data.type === "move") {
+        const { room, payload } = data;
+        if (!rooms[room]) {
+          return ws.send(JSON.stringify({ type: "error", msg: "join first" }));
+        }
+
+        // Save latest move into state
+        rooms[room].state[ws.name] = payload;
+
+        // Broadcast new state to all players
+        broadcast(room, {
+          type: "state",
+          room,
+          state: rooms[room].state
+        });
+      }
+
+    } catch (e) {
+      console.log("Invalid message", e);
+      ws.send(JSON.stringify({ type: "error", msg: "Invalid JSON" }));
     }
-
-    // ---- CHAT (optional) ----
-    if (t === "chat") {
-      const roomId = String(msg.room || "").trim();
-      const room = rooms.get(roomId);
-      if (!room || !room.players.has(ws)) return;
-      const name = room.players.get(ws);
-
-      return broadcastRoom(roomId, {
-        type: "chat",
-        room: roomId,
-        from: name,
-        text: String(msg.text || ""),
-        serverTs: now
-      });
-    }
-
-    // ---- PING -> PONG ----
-    if (t === "ping") {
-      return send(ws, { type: "pong", serverTs: now });
-    }
-
-    // Unknown
-    send(ws, { type: "error", msg: `Unknown type: ${t}`, serverTs: now });
   });
 
-  ws.on("close", () => removeFromAllRooms(ws));
-  ws.on("error", () => removeFromAllRooms(ws));
+  ws.on("close", () => {
+    if (ws.room && rooms[ws.room]) {
+      rooms[ws.room].players = rooms[ws.room].players.filter(p => p !== ws.name);
+      broadcast(ws.room, {
+        type: "state",
+        room: ws.room,
+        state: rooms[ws.room].state
+      });
+
+      // Optional: delete empty room
+      if (rooms[ws.room].players.length === 0) {
+        delete rooms[ws.room];
+      }
+    }
+    console.log("Client disconnected");
+  });
 });
 
-// Heartbeat to keep free tiers healthy and drop dead sockets
-setInterval(() => {
-  wss.clients.forEach((ws) => {
-    if (ws.isAlive === false) {
-      try { ws.terminate(); } catch (_) {}
-      return;
+// Helper: send message to all in a room
+function broadcast(room, data) {
+  const msg = JSON.stringify(data);
+  wss.clients.forEach(c => {
+    if (c.readyState === WebSocket.OPEN && c.room === room) {
+      c.send(msg);
     }
-    ws.isAlive = false;
-    try { ws.ping(); } catch (_) {}
   });
-}, 25000);
+}
