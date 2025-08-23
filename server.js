@@ -6,14 +6,13 @@ const wss = new WebSocket.Server({ port: PORT });
 
 console.log("Cashdeal WS Server running on port", PORT);
 
-// In-memory state
+// ---------------- In‑memory state ----------------
 // rooms[room] = { players: [name,...], state: { name: {...payload} } }
 const rooms = Object.create(null);
-
-// queues[room] = [ws, ws, ...]   // waiting list for 1v1 in that room
+// queues[room] = [ws, ws, ...]   // waiting list for 1v1
 const queues = Object.create(null);
 
-// ---- helpers ----
+// ---------------- helpers ----------------
 function ensureRoom(room) {
   if (!rooms[room]) rooms[room] = { players: [], state: {} };
   if (!queues[room]) queues[room] = [];
@@ -41,15 +40,27 @@ function removeFromQueue(ws) {
   ws.inQueue = false;
 }
 
+function uid() {
+  // tiny unique id: yymmddHHMMSS-xxxx
+  const d = new Date();
+  const pad = (n)=> String(n).padStart(2,"0");
+  const ts = d.getUTCFullYear().toString().slice(2)
+           + pad(d.getUTCMonth()+1) + pad(d.getUTCDate())
+           + pad(d.getUTCHours()) + pad(d.getUTCMinutes())
+           + pad(d.getUTCSeconds());
+  return ts + "-" + Math.random().toString(16).slice(2,6);
+}
+
 function pairIfPossible(room) {
   const q = queues[room];
-  // remove any closed sockets at the front
+  if (!q) return;
+
+  // prune closed/room-mismatched sockets
   for (let i = q.length - 1; i >= 0; i--) {
     const s = q[i];
-    if (!s || s.readyState !== WebSocket.OPEN || s.room !== room) {
-      q.splice(i, 1);
-    }
+    if (!s || s.readyState !== WebSocket.OPEN || s.room !== room) q.splice(i, 1);
   }
+
   if (q.length >= 2) {
     const p1 = q.shift();
     const p2 = q.shift();
@@ -58,34 +69,45 @@ function pairIfPossible(room) {
     p1.inQueue = false;
     p2.inQueue = false;
 
-    // notify both players a match is found (stays in same room)
-    send(p1, { type: "match_found", mode: "1v1", room, opponent: p2.name || "Opponent" });
-    send(p2, { type: "match_found", mode: "1v1", room, opponent: p1.name || "Opponent" });
+    const players = [p1.name || "PlayerA", p2.name || "PlayerB"];
+    const matchId = uid();
 
-    // optional: reset any duel substate here if you want
+    // 👇 EXACT shape your Android client expects
+    const payload = { type: "match_found", mode: "1v1", room, players, matchId };
+
+    send(p1, payload);
+    send(p2, payload);
+
+    // Optional: clear any per-player state for this match
     // rooms[room].state[p1.name] = {};
     // rooms[room].state[p2.name] = {};
+
     broadcast(room, { type: "state", room, state: rooms[room].state });
+    console.log(`[match] room=${room} ${players.join(" vs ")} #${matchId}`);
   }
 }
 
-// ---- main connection handler ----
+// ---------------- heartbeat (avoid ghost clients) ----------------
+function heartbeat() { this.isAlive = true; }
+wss.on("connection", (ws) => { ws.isAlive = true; ws.on("pong", heartbeat); });
+setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) return ws.terminate();
+    ws.isAlive = false; ws.ping(() => {});
+  });
+}, 30000);
+
+// ---------------- main connection handler ----------------
 wss.on("connection", (ws) => {
-  // identify this socket
   ws.room = null;
   ws.name = null;
   ws.inQueue = false;
 
-  // A friendly hello (optional)
   send(ws, { type: "hello", msg: "Welcome to Cashdeal WS" });
 
   ws.on("message", (raw) => {
     let data;
-    try {
-      data = JSON.parse(raw);
-    } catch (e) {
-      return send(ws, { type: "error", msg: "Invalid JSON" });
-    }
+    try { data = JSON.parse(raw); } catch (_) { return send(ws, { type: "error", msg: "Invalid JSON" }); }
 
     const t = data.type;
 
@@ -97,52 +119,41 @@ wss.on("connection", (ws) => {
 
       ensureRoom(room);
 
-      // leave previous queue if any
       if (ws.inQueue) removeFromQueue(ws);
 
       ws.room = room;
       ws.name = name;
 
-      // add to room player list if not present
       const list = rooms[room].players;
       if (!list.includes(name)) list.push(name);
 
-      // reply to this client
       send(ws, { type: "joined", room, you: name, players: rooms[room].players });
-
-      // notify everyone of current state
       broadcast(room, { type: "state", room, state: rooms[room].state });
       return;
     }
 
-    // --- MOVE ---
+    // --- MOVE (optional per-game state sync) ---
     if (t === "move") {
       const room = data.room || ws.room;
-      if (!room || !rooms[room] || !ws.name) {
-        return send(ws, { type: "error", msg: "join first" });
-      }
-      const payload = data.payload || {};
-      rooms[room].state[ws.name] = payload;
+      if (!room || !rooms[room] || !ws.name) return send(ws, { type: "error", msg: "join first" });
+
+      rooms[room].state[ws.name] = data.payload || {};
       return broadcast(room, { type: "state", room, state: rooms[room].state });
     }
 
     // --- QUEUE (1v1) ---
     if (t === "queue") {
-      // requires join first
       const room = data.room || ws.room;
-      if (!room || !rooms[room] || !ws.name) {
-        return send(ws, { type: "error", msg: "join first" });
-      }
+      if (!room || !rooms[room] || !ws.name) return send(ws, { type: "error", msg: "join first" });
       ensureRoom(room);
 
-      // avoid duplicates
       if (!ws.inQueue) {
         queues[room].push(ws);
         ws.inQueue = true;
         send(ws, { type: "queue", status: "waiting", room, mode: data.mode || "1v1" });
+        console.log(`[queue] ${ws.name} in room=${room} (len=${queues[room].length})`);
       }
 
-      // try to pair
       pairIfPossible(room);
       return;
     }
@@ -156,33 +167,22 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    // Unknown type
     send(ws, { type: "error", msg: "unknown type" });
   });
 
   ws.on("close", () => {
-    // remove from queue
     if (ws.inQueue) removeFromQueue(ws);
 
-    // remove from room
     const room = ws.room;
     const name = ws.name;
     if (room && rooms[room]) {
       const list = rooms[room].players;
       const i = list.indexOf(name);
       if (i >= 0) list.splice(i, 1);
-      // (optional) clear personal state
-      if (rooms[room].state && name && rooms[room].state[name]) {
-        delete rooms[room].state[name];
-      }
-      // broadcast updated state
+      if (rooms[room].state && name && rooms[room].state[name]) delete rooms[room].state[name];
       broadcast(room, { type: "state", room, state: rooms[room].state });
 
-      // optional: delete empty room
-      if (rooms[room].players.length === 0) {
-        delete rooms[room];
-        delete queues[room];
-      }
+      if (rooms[room].players.length === 0) { delete rooms[room]; delete queues[room]; }
     }
   });
 });
