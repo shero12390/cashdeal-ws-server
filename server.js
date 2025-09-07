@@ -46,7 +46,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    if (req.url === "/db-ping") {
+    if (req.url === "/db/health") {
       // quick DB check
       const r = await pool.query("SELECT NOW() AS now");
       res.writeHead(200, { "content-type": "application/json" });
