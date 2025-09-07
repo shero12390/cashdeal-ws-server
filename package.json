@@ -1,12 +1,13 @@
 {
   "name": "cashdeal-ws-server",
   "version": "1.0.0",
-  "description": "WebSocket server for Cashdeal games",
   "main": "server.js",
+  "type": "commonjs",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "ws": "^8.14.2"
+    "ws": "^8.14.2",
+    "pg": "^8.11.5"
   }
 }
