@@ -1,138 +1,145 @@
-// server.js — HTTP + WebSocket + Postgres + simple Rooms/Join (escrow)
+// server.js — HTTP + WebSocket + Postgres + Rooms/Escrow (Render-friendly)
 
-// ---- core deps
 const http = require("http");
 const { WebSocketServer } = require("ws");
-const crypto = require("crypto");
 const { Pool } = require("pg");
+const crypto = require("crypto");
 
-// ---- config
 const PORT = process.env.PORT || 3000;
-const pool = new Pool({
-  connectionString: process.env.DB_URL,
-  ssl: { rejectUnauthorized: false }
-});
 
-// ---- tiny helpers
+// =============== Utilities ===============
 function sendJSON(res, code, obj) {
   res.writeHead(code, { "content-type": "application/json" });
   res.end(JSON.stringify(obj));
 }
-
 async function readJSON(req) {
   const chunks = [];
   for await (const c of req) chunks.push(c);
   const raw = Buffer.concat(chunks).toString("utf8") || "{}";
   try { return JSON.parse(raw); } catch { return {}; }
 }
+function uuid() { return crypto.randomUUID(); }
 
-// Simple UUID helper (server-side)
-function newId() { return crypto.randomUUID(); }
+// =============== Postgres ===============
+const pool = new Pool({
+  connectionString: process.env.DB_URL, // set in Render env
+  ssl: { rejectUnauthorized: false }    // required on Render PG
+});
+const q = (sql, params=[]) => pool.query(sql, params);
 
-// ---- in-memory room registry (keeps it simple for now)
-// room = { id, game, stake, maxPlayers, status:'open'|'full', players: [userId] }
-const ROOMS = new Map();
-
-// ---- DB: bootstrap minimal schema if missing
+// =============== DB Migrations (6 tables) ===============
 async function initDb() {
-  const c = await pool.connect();
-  try {
-    await c.query(`CREATE EXTENSION IF NOT EXISTS "uuid-ossp";`);
+  await pool.connect();
+  console.log("✅ Connected to Postgres");
 
-    await c.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-    `);
+  await q(`CREATE EXTENSION IF NOT EXISTS "uuid-ossp";`);
 
-    await c.query(`
-      CREATE TABLE IF NOT EXISTS wallets (
-        user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-        balance NUMERIC(18,2) NOT NULL DEFAULT 0
-      );
-    `);
+  await q(`
+    CREATE TABLE IF NOT EXISTS users (
+      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
 
-    await c.query(`
-      CREATE TABLE IF NOT EXISTS rooms (
-        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-        game TEXT NOT NULL,
-        stake NUMERIC(18,2) NOT NULL,
-        max_players INT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'open',
-        created_by UUID,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-    `);
+  await q(`
+    CREATE TABLE IF NOT EXISTS wallets (
+      user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      balance NUMERIC(18,2) NOT NULL DEFAULT 0
+    );
+  `);
 
-    await c.query(`
-      CREATE TABLE IF NOT EXISTS matches (
-        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-        room_id UUID REFERENCES rooms(id) ON DELETE SET NULL,
-        game TEXT NOT NULL,
-        stake NUMERIC(18,2) NOT NULL,
-        status TEXT NOT NULL DEFAULT 'pending',
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-    `);
+  await q(`
+    CREATE TABLE IF NOT EXISTS rooms (
+      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+      game TEXT NOT NULL,
+      stake NUMERIC(18,2) NOT NULL,
+      max_players INT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','full','in_play','closed')),
+      created_by UUID REFERENCES users(id),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
 
-    await c.query(`
-      CREATE TABLE IF NOT EXISTS match_players (
-        match_id UUID REFERENCES matches(id) ON DELETE CASCADE,
-        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-        result TEXT,
-        PRIMARY KEY (match_id, user_id)
-      );
-    `);
+  await q(`
+    CREATE TABLE IF NOT EXISTS matches (
+      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+      room_id UUID REFERENCES rooms(id) ON DELETE SET NULL,
+      game TEXT NOT NULL,
+      stake NUMERIC(18,2) NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','live','finished','cancelled')),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
 
-    await c.query(`
-      CREATE TABLE IF NOT EXISTS transactions (
-        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-        kind TEXT NOT NULL,                    -- 'deposit','stake_debit','payout','refund'
-        amount NUMERIC(18,2) NOT NULL,         -- positive numbers
-        meta JSONB DEFAULT '{}'::jsonb,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-    `);
+  await q(`
+    CREATE TABLE IF NOT EXISTS match_players (
+      match_id UUID REFERENCES matches(id) ON DELETE CASCADE,
+      user_id  UUID REFERENCES users(id) ON DELETE CASCADE,
+      result   TEXT,
+      PRIMARY KEY (match_id, user_id)
+    );
+  `);
 
-    console.log("✅ DB ready (tables ensured)");
-  } finally {
-    c.release();
-  }
+  await q(`
+    CREATE TABLE IF NOT EXISTS transactions (
+      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+      user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK (kind IN ('deposit','stake_debit','stake_release','payout','refund','withdraw')),
+      amount NUMERIC(18,2) NOT NULL,        // positive values; debits recorded as positive with kind
+      meta JSONB DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  console.log("✅ DB ready (tables ensured)");
 }
 
-// ---- DB helpers (super small, safe)
-async function ensureUserAndWallet(client, userId) {
-  // create user row if missing
-  await client.query(`INSERT INTO users(id) VALUES($1) ON CONFLICT(id) DO NOTHING`, [userId]);
-  // create wallet if missing
-  await client.query(`INSERT INTO wallets(user_id,balance) VALUES($1,0)
-                      ON CONFLICT(user_id) DO NOTHING`, [userId]);
+// =============== Wallet helpers ===============
+async function ensureUserAndWallet(c, userId) {
+  await c.query(`INSERT INTO users(id) VALUES($1) ON CONFLICT(id) DO NOTHING`, [userId]);
+  await c.query(`INSERT INTO wallets(user_id, balance) VALUES($1,0)
+                 ON CONFLICT(user_id) DO NOTHING`, [userId]);
 }
-
-async function getBalance(client, userId) {
-  const r = await client.query(`SELECT balance FROM wallets WHERE user_id=$1`, [userId]);
-  return r.rows[0]?.balance ?? null;
+async function getBalance(c, userId) {
+  const r = await c.query(`SELECT balance FROM wallets WHERE user_id=$1`, [userId]);
+  return r.rows[0] ? Number(r.rows[0].balance) : 0;
 }
-
-async function debitStakeTx(client, userId, amount, meta) {
-  // try atomic debit (fails if not enough)
-  const r = await client.query(
+// Debit stake atomically; throws if funds insufficient
+async function stakeDebit(c, userId, amount, meta) {
+  const r = await c.query(
     `UPDATE wallets SET balance = balance - $2
      WHERE user_id=$1 AND balance >= $2
      RETURNING balance`,
     [userId, amount]
   );
   if (r.rowCount === 0) throw new Error("INSUFFICIENT_FUNDS");
-  await client.query(
+  await c.query(
     `INSERT INTO transactions(user_id, kind, amount, meta)
      VALUES($1,'stake_debit',$2,$3)`,
     [userId, amount, meta || {}]
   );
+  return Number(r.rows[0].balance);
+}
+// Simple credit (deposit/refund/payout)
+async function credit(c, userId, amount, kind, meta) {
+  const r = await c.query(
+    `UPDATE wallets SET balance = balance + $2
+     WHERE user_id=$1
+     RETURNING balance`,
+    [userId, amount]
+  );
+  await c.query(
+    `INSERT INTO transactions(user_id, kind, amount, meta)
+     VALUES($1,$2,$3,$4)`,
+    [userId, kind, amount, meta || {}]
+  );
+  return Number(r.rows[0].balance);
 }
 
-// ---- HTTP server (routes kept simple)
+// =============== In-memory room view (for quick list) ===============
+const ROOM_CACHE = new Map(); // roomId -> {id, game, stake, maxPlayers, status, players:[]}
+
+// =============== HTTP Server ===============
 const server = http.createServer(async (req, res) => {
   try {
     // Health
@@ -141,42 +148,24 @@ const server = http.createServer(async (req, res) => {
     }
 
     // DB ping
-    if (req.url === "/db-ping") {
-      const r = await pool.query(`SELECT NOW() AS now`);
+    if (req.url === "/db/health" || req.url === "/db-ping") {
+      const r = await q(`SELECT NOW() AS now`);
       return sendJSON(res, 200, { ok: true, dbTime: r.rows[0].now });
     }
 
-    // List tables (debug)
-    if (req.url === "/tables") {
-      const r = await pool.query(
-        `SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY tablename`
-      );
-      return sendJSON(res, 200, { ok: true, tables: r.rows.map(x => x.tablename) });
+    // Tables list (debug)
+    if (req.url === "/db/tables") {
+      const r = await q(`
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema='public'
+        ORDER BY table_name;
+      `);
+      return sendJSON(res, 200, { ok: true, tables: r.rows.map(x => x.table_name) });
     }
 
-    // Tiny browser tester
-    if (req.url === "/test") {
-      res.writeHead(200, { "content-type": "text/html" });
-      res.end(`<!doctype html><html><body style="font:14px system-ui">
-<h3>WS test</h3>
-<input id="url" style="width:420px" value="wss://${req.headers.host}/ws">
-<button onclick="go()">Connect</button>
-<pre id="log"></pre>
-<script>
-function log(m){document.getElementById('log').textContent+=m+'\\n'}
-function go(){
-  const u=document.getElementById('url').value;
-  const ws=new WebSocket(u);
-  ws.onopen=()=>{log('open'); ws.send('hello');};
-  ws.onmessage=e=>log('msg: '+e.data);
-  ws.onclose=()=>log('close');
-}
-</script></body></html>`);
-      return;
-    }
-
-    // ---- API: create room (creator does NOT pay yet)
-    // POST /rooms/create   JSON: { userId, game, stake, maxPlayers }
+    // ---- Create Room (creator pays/escrows immediately)
+    // POST /rooms/create  { userId, game, stake, maxPlayers }
     if (req.method === "POST" && req.url === "/rooms/create") {
       const body = await readJSON(req);
       const userId = String(body.userId || "").trim();
@@ -189,46 +178,57 @@ function go(){
       if (!(maxPlayers >= 2 && maxPlayers <= 8))
         return sendJSON(res, 400, { ok: false, error: "BAD_maxPlayers" });
 
-      const roomId = newId();
+      const roomId = uuid();
 
-      // persist basic room row
       const c = await pool.connect();
       try {
         await c.query("BEGIN");
         await ensureUserAndWallet(c, userId);
+
+        // escrow creator's stake now
+        const balAfter = await stakeDebit(c, userId, stake, { roomId, role: "creator" });
+
+        // persist room
         await c.query(
           `INSERT INTO rooms(id, game, stake, max_players, status, created_by)
            VALUES($1,$2,$3,$4,'open',$5)`,
           [roomId, game, stake, maxPlayers, userId]
         );
+
         await c.query("COMMIT");
+
+        // update memory cache
+        ROOM_CACHE.set(roomId, {
+          id: roomId, game, stake, maxPlayers,
+          status: "open", players: [userId]
+        });
+
+        return sendJSON(res, 200, {
+          ok: true,
+          room: ROOM_CACHE.get(roomId),
+          wallet: { balance: String(balAfter) }
+        });
       } catch (e) {
         await c.query("ROLLBACK");
         c.release();
+        if (String(e.message).includes("INSUFFICIENT_FUNDS"))
+          return sendJSON(res, 402, { ok: false, error: "INSUFFICIENT_FUNDS" });
         console.error("create room error:", e);
         return sendJSON(res, 500, { ok: false, error: "ROOM_CREATE_FAILED" });
       } finally {
         c.release();
       }
-
-      // track in-memory too
-      ROOMS.set(roomId, { id: roomId, game, stake, maxPlayers, status: "open", players: [] });
-
-      return sendJSON(res, 200, {
-        ok: true,
-        room: { id: roomId, game, stake, maxPlayers, status: "open", players: [] }
-      });
     }
 
-    // ---- API: join room (escrow stake now)
-    // POST /rooms/join   JSON: { userId, roomId }
+    // ---- Join Room (escrows joiner)
+    // POST /rooms/join  { userId, roomId }
     if (req.method === "POST" && req.url === "/rooms/join") {
       const body = await readJSON(req);
       const userId = String(body.userId || "").trim();
       const roomId = String(body.roomId || "").trim();
       if (!userId || !roomId) return sendJSON(res, 400, { ok: false, error: "MISSING_PARAMS" });
 
-      const room = ROOMS.get(roomId);
+      const room = ROOM_CACHE.get(roomId);
       if (!room) return sendJSON(res, 404, { ok: false, error: "ROOM_NOT_FOUND" });
       if (room.status !== "open") return sendJSON(res, 400, { ok: false, error: "ROOM_CLOSED" });
       if (room.players.includes(userId))
@@ -236,48 +236,45 @@ function go(){
       if (room.players.length >= room.maxPlayers)
         return sendJSON(res, 400, { ok: false, error: "ROOM_FULL" });
 
-      // debit stake inside a DB transaction
       const c = await pool.connect();
       try {
         await c.query("BEGIN");
         await ensureUserAndWallet(c, userId);
-        // check balance and debit
-        await debitStakeTx(c, userId, room.stake, { roomId });
-        const bal = await getBalance(c, userId);
+
+        // escrow joiner's stake
+        const balAfter = await stakeDebit(c, userId, room.stake, { roomId, role: "joiner" });
+
         await c.query("COMMIT");
 
-        // update in-memory list
+        // update memory cache
         room.players.push(userId);
         if (room.players.length >= room.maxPlayers) room.status = "full";
-        ROOMS.set(roomId, room);
+        ROOM_CACHE.set(roomId, room);
 
         return sendJSON(res, 200, {
           ok: true,
           room,
-          wallet: { balance: String(bal) }
+          wallet: { balance: String(balAfter) }
         });
       } catch (e) {
         await c.query("ROLLBACK");
         c.release();
         if (String(e.message).includes("INSUFFICIENT_FUNDS"))
           return sendJSON(res, 402, { ok: false, error: "INSUFFICIENT_FUNDS" });
-        console.error("join error:", e);
+        console.error("join room error:", e);
         return sendJSON(res, 500, { ok: false, error: "JOIN_FAILED" });
       } finally {
         c.release();
       }
     }
 
-    // ---- API: list rooms (simple)
+    // ---- List Rooms
     // GET /rooms
     if (req.method === "GET" && req.url === "/rooms") {
-      return sendJSON(res, 200, {
-        ok: true,
-        rooms: Array.from(ROOMS.values())
-      });
+      return sendJSON(res, 200, { ok: true, rooms: Array.from(ROOM_CACHE.values()) });
     }
 
-    // default 404
+    // Default 404
     return sendJSON(res, 404, { ok: false, error: "not_found" });
   } catch (err) {
     console.error("HTTP error:", err);
@@ -285,7 +282,7 @@ function go(){
   }
 });
 
-// ---- WebSocket echo (unchanged)
+// =============== WebSocket (echo for now) ===============
 const wss = new WebSocketServer({ noServer: true });
 wss.on("connection", (ws) => {
   ws.on("message", (m) => ws.send(String(m)));
@@ -299,10 +296,10 @@ server.on("upgrade", (req, socket, head) => {
   }
 });
 
-// ---- boot
+// =============== Boot ===============
 initDb()
   .then(() => {
-    server.listen(PORT, () => console.log(`✅ Server on :${PORT}`));
+    server.listen(PORT, () => console.log(`✅ Server listening on :${PORT}`));
   })
   .catch((err) => {
     console.error("❌ Startup error:", err);
