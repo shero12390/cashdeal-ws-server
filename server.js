@@ -395,6 +395,98 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 500, { ok:false, error:"server_error" });
       } finally { client.release(); }
     }
+
+/* ---------- ROOMS: REJOIN (only within grace window) ---------- */
+if (req.method === "POST" && pathname === "/rooms/rejoin") {
+  let body;
+  try { body = await readJsonBody(req); }
+  catch { return sendJson(res, 400, { ok:false, error:"invalid_json" }); }
+
+  const roomId = String(body.roomId || "").trim();
+  const userId = await ensureUserWithWallet(body.userId);
+
+  if (!roomId || !userId) {
+    return sendJson(res, 400, { ok:false, error:"missing_params" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // Lock room
+    const rRoom = await client.query(`SELECT * FROM rooms WHERE id=$1 FOR UPDATE`, [roomId]);
+    if (rRoom.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return sendJson(res, 404, { ok:false, error:"room_not_found" });
+    }
+    const room = rRoom.rows[0];
+
+    // Find latest active match for this room
+    const rMatch = await client.query(
+      `SELECT id, status FROM matches
+        WHERE room_id=$1 AND status IN ('ready','running','live','in_play')
+        ORDER BY created_at DESC
+        LIMIT 1`,
+      [room.id]
+    );
+    if (rMatch.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return sendJson(res, 400, { ok:false, error:"no_active_match" });
+    }
+    const match = rMatch.rows[0];
+
+    // Check this user has a seat and is still within grace
+    const rMP = await client.query(
+      `SELECT user_id, left_at, grace_until
+         FROM match_players
+        WHERE match_id=$1 AND user_id=$2
+        FOR UPDATE`,
+      [match.id, userId]
+    );
+    if (rMP.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return sendJson(res, 404, { ok:false, error:"not_in_match" });
+    }
+
+    const mp = rMP.rows[0];
+    // If no grace set or grace expired, reject
+    if (!mp.grace_until) {
+      await client.query("ROLLBACK");
+      return sendJson(res, 400, { ok:false, error:"no_grace_set" });
+    }
+    const rNow = await client.query(`SELECT NOW() AS now`);
+    const now = new Date(rNow.rows[0].now);
+    const graceUntil = new Date(mp.grace_until);
+    if (now > graceUntil) {
+      await client.query("ROLLBACK");
+      return sendJson(res, 400, { ok:false, error:"grace_expired" });
+    }
+
+    // Clear leave markers — player is back
+    await client.query(
+      `UPDATE match_players
+          SET left_at = NULL,
+              grace_until = NULL
+        WHERE match_id=$1 AND user_id=$2`,
+      [match.id, userId]
+    );
+
+    await client.query("COMMIT");
+    return sendJson(res, 200, {
+      ok: true,
+      note: "rejoined_success",
+      roomStatus: room.status,
+      matchId: match.id
+    });
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch {}
+    console.error("rooms/rejoin error", e);
+    return sendJson(res, 500, { ok:false, error:"server_error" });
+  } finally {
+    client.release();
+  }
+}
+
 /* ---------- ROOMS: LEAVE (no refund; 90s grace if match is live) ---------- */
 if (req.method === "POST" && pathname === "/rooms/leave") {
   let body;
