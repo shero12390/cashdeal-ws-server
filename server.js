@@ -188,31 +188,58 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { ok: true, dbTime: r.rows[0].now });
     }
 
-    /* ---------- WALLET: DEPOSIT (test only) ---------- */
-    if (req.method === "POST" && pathname === "/wallet/deposit") {
-      let body; try { body = await readJsonBody(req); } catch { return sendJson(res, 400, { ok:false, error:"invalid_json" }); }
-      const amount = n(body.amount, NaN);
-      if (!Number.isFinite(amount) || amount <= 0) return sendJson(res, 400, { ok:false, error:"invalid_amount" });
-      const userId = await ensureUserWithWallet(body.userId);
+    
+// ---------- WALLET: DEPOSIT (for testing) ----------
+if (req.method === "POST" && pathname === "/wallet/deposit") {
+  let body;
+  try { body = await readJsonBody(req); } 
+  catch { return sendJson(res, 400, { ok:false, error:"invalid_json" }); }
 
-      const client = await pool.connect();
-      try {
-        await client.query("BEGIN");
-        await client.query(`UPDATE wallets SET balance = balance + $1, updated_at = NOW() WHERE user_id=$2`, [amount, userId]);
-        const rBal = await client.query(`SELECT balance FROM wallets WHERE user_id=$1`, [userId]);
-        await client.query(
-          `INSERT INTO transactions (user_id, amount, reason, ref_match_id, balance_after)
-           VALUES ($1, $2, 'deposit', NULL, $3)`,
-          [userId, amount, rBal.rows[0].balance]
-        );
-        await client.query("COMMIT");
-        return sendJson(res, 200, { ok:true, userId, wallet: { balance: rBal.rows[0].balance, currency: "USDT" } });
-      } catch (e) {
-        try { await client.query("ROLLBACK"); } catch {}
-        console.error("deposit error", e);
-        return sendJson(res, 500, { ok:false, error:"server_error" });
-      } finally { client.release(); }
-    }
+  const userIdIn = String(body.userId || "").trim();
+  const amt = Number(body.amount);
+  if (!Number.isFinite(amt) || amt <= 0) {
+    return sendJson(res, 400, { ok:false, error:"invalid_amount" });
+  }
+
+  const userId = await ensureUserWithWallet(userIdIn);
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // credit wallet
+    await client.query(
+      `UPDATE wallets 
+          SET balance = balance + $1, updated_at = NOW()
+        WHERE user_id = $2`,
+      [amt, userId]
+    );
+
+    // fetch new balance for balance_after column
+    const rBal = await client.query(
+      `SELECT balance FROM wallets WHERE user_id=$1`,
+      [userId]
+    );
+    const newBal = Number(rBal.rows[0]?.balance ?? 0);
+
+    // transactions table in your DB: id, created_at, user_id, amount, reason, ref_match_id, balance_after
+    await client.query(
+      `INSERT INTO transactions (user_id, amount, reason, ref_match_id, balance_after)
+       VALUES ($1, $2, 'deposit', NULL, $3)`,
+      [userId, amt, newBal]
+    );
+
+    await client.query("COMMIT");
+    return sendJson(res, 200, { ok:true, userId, wallet: { balance: newBal, currency: 'USDT' } });
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch {}
+    console.error("deposit error", e);
+    return sendJson(res, 500, { ok:false, error:"server_error" });
+  } finally {
+    client.release();
+  }
+}
+
 
     /* ---------- ROOMS: CREATE ---------- */
     if (req.method === "POST" && pathname === "/rooms/create") {
