@@ -641,6 +641,108 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { ok: true, room: rRoom.rows[0], players: rPlayers.rows });
     }
 
+// ---------- MATCHES: FINISH ----------
+if (req.method === "POST" && pathname === "/matches/finish") {
+  let body;
+  try { body = await readJsonBody(req); } catch { return sendJson(res, 400, { ok:false, error:"invalid_json" }); }
+
+  const matchId = String(body.matchId || "").trim();
+  const results = Array.isArray(body.results) ? body.results : [];
+  if (!matchId || results.length === 0) {
+    return sendJson(res, 400, { ok:false, error:"missing_params" });
+  }
+
+  // Fetch match + players
+  const rMatch = await q(
+    `SELECT m.id, m.room_id, m.game, m.stake, m.status
+       FROM matches m
+      WHERE m.id = $1`,
+    [matchId]
+  );
+  if (rMatch.rowCount === 0) return sendJson(res, 404, { ok:false, error:"match_not_found" });
+  const match = rMatch.rows[0];
+
+  if (!["ready","running","live"].includes(match.status)) {
+    return sendJson(res, 400, { ok:false, error:"invalid_state", status: match.status });
+  }
+
+  const rPlayers = await q(
+    `SELECT user_id FROM match_players WHERE match_id = $1`,
+    [matchId]
+  );
+  const playerIds = new Set(rPlayers.rows.map(r => String(r.user_id)));
+
+  // normalize results input
+  const allowed = new Set(["won","lost","draw","cancelled"]);
+  const incoming = new Map(
+    results
+      .map(r => [String(r.userId || "").trim(), String(r.result || "").trim()])
+      .filter(([uid, res]) => uid && allowed.has(res))
+  );
+
+  // Validate: must provide a result for each participant
+  if (incoming.size !== playerIds.size || [...playerIds].some(uid => !incoming.has(uid))) {
+    return sendJson(res, 400, { ok:false, error:"results_must_cover_all_players" });
+  }
+
+  // Compute winners for payouts
+  const winners = [...incoming.entries()].filter(([,res]) => res === "won").map(([uid]) => uid);
+  const numPlayers = playerIds.size;
+  const perPlayerStake = Number(match.stake) || 0;
+  const prizePool = perPlayerStake * numPlayers;
+  const perWinner = winners.length > 0 ? prizePool / winners.length : 0;
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // Update match_players results
+    await client.query(
+      `UPDATE match_players mp
+          SET result = x.res
+         FROM (VALUES ${[...incoming.entries()].map((_,i)=>`($${i*2+1}::uuid,$${i*2+2}::text)`).join(",")}) AS x(uid,res)
+        WHERE mp.match_id = $${incoming.size*2+1}::uuid
+          AND mp.user_id = x.uid`,
+      [...[...incoming.entries()].flatMap(([uid,res]) => [uid, res]), matchId]
+    );
+
+    // Payouts (only if stake > 0 and winners exist)
+    if (perWinner > 0 && winners.length > 0) {
+      for (const uid of winners) {
+        await client.query(
+          `UPDATE wallets SET balance = balance + $1, updated_at = NOW() WHERE user_id=$2`,
+          [perWinner, uid]
+        );
+        await client.query(
+          `INSERT INTO transactions (user_id, amount, side, reason, meta)
+           VALUES ($1, $2, 'credit', 'payout', jsonb_build_object('matchId',$3,'game',$4))`,
+          [uid, perWinner, matchId, match.game]
+        );
+      }
+    }
+
+    // Close match + room
+    await client.query(
+      `UPDATE matches SET status='finished', ended_at = NOW() WHERE id=$1`,
+      [matchId]
+    );
+    if (match.room_id) {
+      await client.query(`UPDATE rooms SET status='closed' WHERE id=$1`, [match.room_id]);
+    }
+
+    await client.query("COMMIT");
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch {}
+    console.error("matches/finish error", e);
+    return sendJson(res, 500, { ok:false, error: e.message || "server_error" });
+  } finally {
+    client.release();
+  }
+
+  const rDone = await q(`SELECT id, room_id, game, stake, status, started_at, ended_at FROM matches WHERE id=$1`, [matchId]);
+  return sendJson(res, 200, { ok:true, match: rDone.rows[0], payouts: (perWinner>0? {winners, perWinner}: null) });
+}
+
     // ---------- ROOMS: LIST ----------
     if (req.method === "GET" && pathname === "/rooms/list") {
       const status = String(query.status || "open");
