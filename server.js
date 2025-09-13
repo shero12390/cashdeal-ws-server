@@ -536,4 +536,162 @@ const server = http.createServer(async (req, res) => {
           [roomId, userId]
         );
         if (rMember.rowCount === 0) {
-          await client.query("
+          await client.query("ROLLBACK");
+          return sendJson(res, 400, { ok: false, error: "not_in_room" });
+        }
+
+        await client.query(
+          `UPDATE room_players SET ready=$3 WHERE room_id=$1 AND user_id=$2`,
+          [roomId, userId, ready]
+        );
+
+        // attempt to start if eligible
+        const matchId = await startMatchIfEligible(client, roomId);
+
+        await client.query("COMMIT");
+
+        // return room status + players readiness
+        const rRoom2 = await q(`SELECT * FROM rooms WHERE id=$1`, [roomId]);
+        const rPlayers2 = await q(
+          `SELECT user_id, ready, joined_at FROM room_players WHERE room_id=$1 ORDER BY joined_at ASC`,
+          [roomId]
+        );
+        return sendJson(res, 200, {
+          ok: true,
+          room: rRoom2.rows[0],
+          players: rPlayers2.rows,
+          startedMatchId: matchId || null,
+        });
+      } catch (e) {
+        try { await client.query("ROLLBACK"); } catch {}
+        console.error("rooms/ready error", e);
+        return sendJson(res, 500, { ok: false, error: e.message || "server_error" });
+      } finally {
+        client.release();
+      }
+    }
+
+    // ---------- ROOMS: LEAVE (refund if room is open) ----------
+    if (req.method === "POST" && pathname === "/rooms/leave") {
+      let body;
+      try { body = await readJsonBody(req); } catch (e) { return sendJson(res, 400, { ok: false, error: "invalid_json" }); }
+
+      const roomId = String(body.roomId || "").trim();
+      const userIdIn = String(body.userId || "").trim() || null;
+      if (!roomId) return sendJson(res, 400, { ok: false, error: "missing_roomId" });
+
+      const rRoom = await q(`SELECT * FROM rooms WHERE id=$1`, [roomId]);
+      if (rRoom.rowCount === 0) return sendJson(res, 404, { ok: false, error: "room_not_found" });
+      const room = rRoom.rows[0];
+      if (room.status !== "open") return sendJson(res, 400, { ok: false, error: "room_not_open" });
+
+      const userId = await ensureUserWithWallet(userIdIn);
+
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+
+        // remove from room_players (idempotent)
+        await client.query(`DELETE FROM room_players WHERE room_id=$1 AND user_id=$2`, [room.id, userId]);
+
+        // Simple refund of stake if stake > 0
+        const stakeNum = toNumber(room.stake, 0);
+        if (stakeNum > 0) {
+          await client.query(
+            `UPDATE wallets SET balance = balance + $1, updated_at = NOW() WHERE user_id=$2`,
+            [stakeNum, userId]
+          );
+          await client.query(
+            `INSERT INTO transactions (user_id, amount, side, reason, meta)
+             VALUES ($1, $2, 'credit', 'refund', jsonb_build_object('roomId',$3))`,
+            [userId, stakeNum, room.id]
+          );
+        }
+
+        // Decrement player count but keep at minimum 1 (host)
+        await client.query(
+          `UPDATE rooms
+             SET current_players = GREATEST(current_players - 1, 1)
+           WHERE id = $1`,
+          [room.id]
+        );
+
+        await client.query("COMMIT");
+        const rRoom2 = await q(`SELECT * FROM rooms WHERE id=$1`, [room.id]);
+        return sendJson(res, 200, { ok: true, room: rRoom2.rows[0] });
+      } catch (e) {
+        try { await client.query("ROLLBACK"); } catch {}
+        console.error("rooms/leave error", e);
+        return sendJson(res, 500, { ok: false, error: e.message || "server_error" });
+      } finally {
+        client.release();
+      }
+    }
+
+    // ---------- ROOMS: STATUS ----------
+    if (req.method === "GET" && pathname === "/rooms/status") {
+      const roomId = String(query.roomId || "").trim();
+      if (!roomId) return sendJson(res, 400, { ok: false, error: "missing_roomId" });
+      const rRoom = await q(`SELECT * FROM rooms WHERE id=$1`, [roomId]);
+      if (rRoom.rowCount === 0) return sendJson(res, 404, { ok: false, error: "room_not_found" });
+      const rPlayers = await q(
+        `SELECT user_id, ready, joined_at FROM room_players WHERE room_id=$1 ORDER BY joined_at ASC`,
+        [roomId]
+      );
+      return sendJson(res, 200, { ok: true, room: rRoom.rows[0], players: rPlayers.rows });
+    }
+
+    // ---------- ROOMS: LIST ----------
+    if (req.method === "GET" && pathname === "/rooms/list") {
+      const status = String(query.status || "open");
+      const r = await q(
+        `SELECT id, host_user_id, game, stake, max_players, current_players, status, created_at,
+                mode, min_players, autostart, countdown_seconds, require_mutual_ready, config
+           FROM rooms
+          WHERE status = $1
+          ORDER BY created_at DESC
+          LIMIT 100`,
+        [status]
+      );
+      return sendJson(res, 200, { ok: true, rooms: r.rows });
+    }
+
+    // default 404
+    return sendJson(res, 404, { ok: false, error: "not_found" });
+  } catch (err) {
+    console.error("HTTP error:", err);
+    const msg = err?.kind === "invalid_json" ? "invalid_json" : "server_error";
+    return sendJson(res, 500, { ok: false, error: msg });
+  }
+});
+
+/* =========================
+   WebSocket (simple echo)
+   ========================= */
+const wss = new WebSocketServer({ noServer: true });
+wss.on("connection", (ws) => {
+  ws.on("message", (m) => ws.send(String(m)));
+  ws.send("connected");
+});
+server.on("upgrade", (req, socket, head) => {
+  if (req.url === "/ws") {
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+  } else {
+    socket.destroy();
+  }
+});
+
+/* =========================
+   Boot
+   ========================= */
+(async () => {
+  try {
+    await pool.connect();
+    console.log("✅ Connected to Postgres");
+    await runMigrations();
+    server.listen(PORT, () => console.log(`✅ Server on :${PORT}`));
+  } catch (e) {
+    console.error("❌ Startup error", e);
+    process.exit(1);
+  }
+})();
