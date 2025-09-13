@@ -41,7 +41,7 @@ async function readJsonBody(req) {
 function n(v, f = 0) { const x = Number(v); return Number.isFinite(x) ? x : f; }
 
 /* =========================
-   Migrations (aligned to your DB)
+   Migrations
    ========================= */
 async function runMigrations() {
   await q(`CREATE EXTENSION IF NOT EXISTS "uuid-ossp";`);
@@ -71,7 +71,7 @@ async function runMigrations() {
       stake NUMERIC(18,2) NOT NULL DEFAULT 0,
       max_players INT NOT NULL CHECK (max_players >= 2 AND max_players <= 10),
       current_players INT NOT NULL DEFAULT 1,
-      status TEXT NOT NULL DEFAULT 'open',  -- open | locked | in_play | full | closed
+      status TEXT NOT NULL DEFAULT 'open',
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       mode TEXT NOT NULL DEFAULT 'h2h',
       min_players INT NOT NULL DEFAULT 2,
@@ -177,7 +177,7 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(204, {
         "access-control-allow-origin": "*",
         "access-control-allow-methods": "GET,POST,OPTIONS",
-        "access-control-allow-headers": "content-type",
+        "access-control-allow-headers": "content-type,x-sync-secret",
       });
       return res.end();
     }
@@ -188,7 +188,7 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { ok: true, dbTime: r.rows[0].now });
     }
 
-    // ---------- WALLET: DEPOSIT (for testing) ----------
+    // ---------- WALLET: DEPOSIT (testing only) ----------
     if (req.method === "POST" && pathname === "/wallet/deposit") {
       let body;
       try { body = await readJsonBody(req); }
@@ -237,6 +237,26 @@ const server = http.createServer(async (req, res) => {
       } finally {
         client.release();
       }
+    }
+
+    /* ---------- INTERNAL: WALLET SYNC (Firebase -> Render) ---------- */
+    if (req.method === "POST" && pathname === "/internal/wallet/sync") {
+      if (req.headers["x-sync-secret"] !== process.env.SYNC_SECRET) {
+        return sendJson(res, 401, { ok:false, error:"unauthorized" });
+      }
+      let body; try { body = await readJsonBody(req); }
+      catch { return sendJson(res, 400, { ok:false, error:"invalid_json" }); }
+
+      const uid = String(body.uid || body.userId || "").trim();
+      const balance = Number(body.balance);
+
+      if (!uid || !Number.isFinite(balance)) {
+        return sendJson(res, 400, { ok:false, error:"bad_params" });
+      }
+
+      const userId = await ensureUserWithWallet(uid);
+      await q(`UPDATE wallets SET balance=$1, updated_at=NOW() WHERE user_id=$2`, [balance, userId]);
+      return sendJson(res, 200, { ok:true });
     }
 
     /* ---------- ROOMS: CREATE ---------- */
@@ -420,10 +440,9 @@ const server = http.createServer(async (req, res) => {
       } finally { client.release(); }
     }
 
-    /* ---------- ROOMS: REJOIN (only within grace window) ---------- */
+    /* ---------- ROOMS: REJOIN (only within grace) ---------- */
     if (req.method === "POST" && pathname === "/rooms/rejoin") {
-      let body;
-      try { body = await readJsonBody(req); }
+      let body; try { body = await readJsonBody(req); }
       catch { return sendJson(res, 400, { ok:false, error:"invalid_json" }); }
 
       const roomId = String(body.roomId || "").trim();
@@ -473,29 +492,24 @@ const server = http.createServer(async (req, res) => {
         );
 
         await client.query("COMMIT");
-        return sendJson(res, 200, { ok: true, note: "rejoined_success", roomStatus: room.status, matchId: match.id });
+        return sendJson(res, 200, { ok:true, note:"rejoined_success", roomStatus: room.status, matchId: match.id });
       } catch (e) {
         try { await client.query("ROLLBACK"); } catch {}
         console.error("rooms/rejoin error", e);
         return sendJson(res, 500, { ok:false, error:"server_error" });
-      } finally {
-        client.release();
-      }
+      } finally { client.release(); }
     }
 
- /* ---------- ROOMS: LEAVE (no refund; 90s grace if match is live) ---------- */
+  /* ---------- ROOMS: LEAVE (no refund; 90s grace) ---------- */
     if (req.method === "POST" && pathname === "/rooms/leave") {
-      let body;
-      try { body = await readJsonBody(req); }
+      let body; try { body = await readJsonBody(req); }
       catch { return sendJson(res, 400, { ok:false, error:"invalid_json" }); }
 
       const roomId  = String(body.roomId || "").trim();
       const userId  = await ensureUserWithWallet(body.userId);
       const GRACE_S = 90;
-
       if (!roomId) return sendJson(res, 400, { ok:false, error:"missing_roomId" });
-
-      const client = await pool.connect();
+const client = await pool.connect();
       try {
         await client.query("BEGIN");
 
@@ -503,23 +517,23 @@ const server = http.createServer(async (req, res) => {
         if (rRoom.rowCount === 0) { await client.query("ROLLBACK"); return sendJson(res, 404, { ok:false, error:"room_not_found" }); }
         const room = rRoom.rows[0];
 
+        // active match?
         const rMatch = await client.query(
           `SELECT id, status, stake FROM matches
-             WHERE room_id=$1 AND status IN ('ready','running','live','in_play')
-             ORDER BY created_at DESC LIMIT 1`,
+           WHERE room_id=$1 AND status IN ('ready','running','live','in_play')
+           ORDER BY created_at DESC LIMIT 1`,
           [room.id]
         );
 
         if (rMatch.rowCount > 0) {
           const match = rMatch.rows[0];
 
+          // mark temp leave (no refund)
           const rMP = await client.query(
             `SELECT match_id, user_id FROM match_players
-              WHERE match_id=$1 AND user_id=$2
-              FOR UPDATE`,
+             WHERE match_id=$1 AND user_id=$2 FOR UPDATE`,
             [match.id, userId]
           );
-
           if (rMP.rowCount === 0) {
             await client.query("COMMIT");
             return sendJson(res, 200, { ok:true, note:"not_in_match", room, matchId: match.id });
@@ -527,32 +541,28 @@ const server = http.createServer(async (req, res) => {
 
           const rGrace = await client.query(
             `UPDATE match_players
-                SET left_at = NOW(),
-                    grace_until = NOW() + make_interval(secs => $1)
-              WHERE match_id=$2 AND user_id=$3
-              RETURNING left_at, grace_until`,
+               SET left_at = NOW(),
+                   grace_until = NOW() + make_interval(secs => $1)
+             WHERE match_id=$2 AND user_id=$3
+             RETURNING left_at, grace_until`,
             [GRACE_S, match.id, userId]
           );
 
           await client.query("COMMIT");
           return sendJson(res, 200, {
-            ok: true,
-            note: "left_temporarily_no_refund",
+            ok:true,
+            note:"left_temporarily_no_refund",
             roomStatus: room.status,
             matchId: match.id,
             grace: rGrace.rows[0]
           });
         }
 
-        // lobby leave (no refund policy)
-        await client.query(
-          `DELETE FROM room_players WHERE room_id=$1 AND user_id=$2`,
-          [room.id, userId]
-        ).catch(() => null);
-
+        // no active match: leaving lobby (no refund), adjust counters
+        await client.query(`DELETE FROM room_players WHERE room_id=$1 AND user_id=$2`, [room.id, userId]).catch(()=>null);
         await client.query(
           `UPDATE rooms SET current_players = GREATEST(current_players - 1, 0)
-             WHERE id=$1`,
+           WHERE id=$1`,
           [room.id]
         );
 
@@ -589,10 +599,10 @@ const server = http.createServer(async (req, res) => {
       const r = await q(
         `SELECT id, host_user_id, game, stake, max_players, current_players, status,
                 created_at, mode, min_players, autostart, countdown_seconds, require_mutual_ready, config
-           FROM rooms
-          WHERE status=$1
-          ORDER BY created_at DESC
-          LIMIT 100`,
+         FROM rooms
+         WHERE status=$1
+         ORDER BY created_at DESC
+         LIMIT 100`,
         [status]
       );
       return sendJson(res, 200, { ok:true, rooms: r.rows });
@@ -606,13 +616,10 @@ const server = http.createServer(async (req, res) => {
       const results = Array.isArray(body.results) ? body.results : [];
       if (!matchId || results.length === 0) return sendJson(res, 400, { ok:false, error:"missing_params" });
 
-      const rMatch = await q(
-        `SELECT id, room_id, game, stake, status FROM matches WHERE id=$1`,
-        [matchId]
-      );
+      const rMatch = await q(`SELECT id, room_id, game, stake, status FROM matches WHERE id=$1`, [matchId]);
       if (rMatch.rowCount === 0) return sendJson(res, 404, { ok:false, error:"match_not_found" });
       const match = rMatch.rows[0];
-      if (!["ready","running","live","in_play"].includes(match.status)) {
+      if (!["ready","running","live"].includes(match.status)) {
         return sendJson(res, 400, { ok:false, error:"invalid_state", status: match.status });
       }
 
@@ -677,7 +684,7 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { ok:true, match: rDone.rows[0], payouts: (perWinner>0 ? { winners, perWinner } : null) });
     }
 
-    // default 404
+    // fallback
     return sendJson(res, 404, { ok:false, error:"not_found" });
   } catch (e) {
     console.error("HTTP error", e);
@@ -686,7 +693,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 /* =========================
-   WebSocket (simple echo)
+   WebSocket & Boot
    ========================= */
 const wss = new WebSocketServer({ noServer: true });
 wss.on("connection", (ws) => {
@@ -696,22 +703,17 @@ wss.on("connection", (ws) => {
 server.on("upgrade", (req, socket, head) => {
   if (req.url === "/ws") {
     wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
-  } else {
-    socket.destroy();
-  }
+  } else socket.destroy();
 });
 
-/* =========================
-   Boot
-   ========================= */
 (async () => {
   try {
     await pool.connect();
-    console.log("✅ Connected to Postgres");
+    console.log("✅ connected to Postgres");
     await runMigrations();
-    server.listen(PORT, () => console.log(`✅ Server on :${PORT}`));
+    server.listen(PORT, () => console.log(`✅ server listening on :${PORT}`));
   } catch (e) {
-    console.error("❌ Startup error", e);
+    console.error("❌ startup error", e);
     process.exit(1);
   }
 })();
