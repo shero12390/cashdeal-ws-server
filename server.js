@@ -1,57 +1,46 @@
-// server.js — HTTP + WebSocket + Postgres (Render-ready, full version)
+// server.js — HTTP + WebSocket + Postgres (Render-ready, with new room fields)
 
-const http = require("http");
-const url = require("url");
-const { WebSocketServer } = require("ws");
-const { Pool } = require("pg");
+const http = require('http');
+const url = require('url');
+const { WebSocketServer } = require('ws');
+const { Pool } = require('pg');
 
 const PORT = process.env.PORT || 3000;
 
 /* =========================
-   Postgres: pool + helpers
+   Postgres
    ========================= */
 const pool = new Pool({
   connectionString: process.env.DB_URL,
-  ssl: { rejectUnauthorized: false }, // Render PG requires SSL
+  ssl: { rejectUnauthorized: false },
 });
-
-async function q(sql, params = []) {
-  return pool.query(sql, params);
-}
+const q = (sql, params=[]) => pool.query(sql, params);
 
 function sendJson(res, code, obj) {
   res.writeHead(code, {
-    "content-type": "application/json",
-    "cache-control": "no-store",
+    'content-type': 'application/json',
+    'cache-control': 'no-store',
   });
   res.end(JSON.stringify(obj));
 }
+function toNumber(n, fallback=0){ const v = Number(n); return Number.isFinite(v) ? v : fallback; }
+function isInt(n){ return typeof n === 'number' && Number.isInteger(n); }
 
-async function readJsonBody(req) {
-  return new Promise((resolve, reject) => {
-    let data = "";
-    req.on("data", (c) => (data += c));
-    req.on("end", () => {
-      if (!data) return resolve({});
-      try {
-        resolve(JSON.parse(data));
-      } catch (e) {
-        reject(Object.assign(new Error("invalid_json"), { kind: "invalid_json" }));
-      }
-    });
-    req.on("error", reject);
+async function readJsonBody(req){
+  return new Promise((resolve, reject)=>{
+    let d=''; req.on('data', c=> d+=c);
+    req.on('end', ()=>{ if(!d) return resolve({}); try{ resolve(JSON.parse(d)); }catch(e){ reject({kind:'invalid_json'});} });
+    req.on('error', reject);
   });
 }
 
 /* =========================
-   DB bootstrap (migrations)
+   Migrations (idempotent)
    ========================= */
 async function runMigrations() {
-  // Extensions
   await q(`CREATE EXTENSION IF NOT EXISTS "uuid-ossp";`);
   await q(`CREATE EXTENSION IF NOT EXISTS "pgcrypto";`);
 
-  // users
   await q(`
     CREATE TABLE IF NOT EXISTS users (
       id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -59,7 +48,6 @@ async function runMigrations() {
     );
   `);
 
-  // wallets
   await q(`
     CREATE TABLE IF NOT EXISTS wallets (
       user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -69,440 +57,416 @@ async function runMigrations() {
     );
   `);
 
-  // rooms
+  // Base rooms table (aligns with your live schema; then add new columns below)
   await q(`
     CREATE TABLE IF NOT EXISTS rooms (
       id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-      host_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      game TEXT NOT NULL,
-      stake NUMERIC(18,2) NOT NULL DEFAULT 0,
-      max_players INT NOT NULL CHECK (max_players >= 2 AND max_players <= 8),
-      current_players INT NOT NULL DEFAULT 1,
-      status TEXT NOT NULL DEFAULT 'open',  -- open | full | closed
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      -- in your live DB 'host_user_id' exists; ensure it's there
+      host_user_id UUID,
+      -- keep compatibility with existing columns
+      max_players INT NOT NULL DEFAULT 4,
+      status TEXT NOT NULL DEFAULT 'open'
     );
   `);
-  await q(`CREATE INDEX IF NOT EXISTS idx_rooms_status ON rooms(status);`);
 
-  // matches (created when a room fills)
+  // Add/ensure the new flexible columns you created
+  await q(`ALTER TABLE rooms ADD COLUMN IF NOT EXISTS game                TEXT;`);
+  await q(`ALTER TABLE rooms ADD COLUMN IF NOT EXISTS mode                TEXT NOT NULL DEFAULT 'h2h';`);
+  await q(`ALTER TABLE rooms ADD COLUMN IF NOT EXISTS min_players         INT  NOT NULL DEFAULT 2;`);
+  await q(`ALTER TABLE rooms ADD COLUMN IF NOT EXISTS autostart           BOOLEAN NOT NULL DEFAULT FALSE;`);
+  await q(`ALTER TABLE rooms ADD COLUMN IF NOT EXISTS countdown_seconds   INT  NOT NULL DEFAULT 0;`);
+  await q(`ALTER TABLE rooms ADD COLUMN IF NOT EXISTS require_mutual_ready BOOLEAN NOT NULL DEFAULT FALSE;`);
+  await q(`ALTER TABLE rooms ADD COLUMN IF NOT EXISTS config              JSONB NOT NULL DEFAULT '{}'::jsonb;`);
+  await q(`ALTER TABLE rooms ADD COLUMN IF NOT EXISTS current_players     INT  NOT NULL DEFAULT 1;`);
+
+  await q(`CREATE INDEX IF NOT EXISTS idx_rooms_status ON rooms(status);`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_room_status ON rooms(status);`);
+
+  // Matches use stake_amount (your live table already has these)
   await q(`
     CREATE TABLE IF NOT EXISTS matches (
       id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-      room_id UUID NOT NULL REFERENCES rooms(id) ON DELETE SET NULL,
-      game TEXT NOT NULL,
-      stake NUMERIC(18,2) NOT NULL,
-      status TEXT NOT NULL DEFAULT 'ready', -- ready | running | finished | cancelled
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      room_id UUID REFERENCES rooms(id) ON DELETE SET NULL,
+      status TEXT NOT NULL DEFAULT 'waiting',
+      stake_amount NUMERIC(18,2) NOT NULL DEFAULT 0,
+      currency TEXT NOT NULL DEFAULT 'USDT',
+      winner_user_id UUID,
+      game TEXT,
       started_at TIMESTAMPTZ,
       ended_at TIMESTAMPTZ
     );
   `);
+  await q(`CREATE INDEX IF NOT EXISTS idx_match_room ON matches(room_id);`);
 
-  // match_players (players who participate in a match)
   await q(`
     CREATE TABLE IF NOT EXISTS match_players (
       match_id UUID NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
-      user_id  UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      user_id  UUID NOT NULL REFERENCES users(id)  ON DELETE CASCADE,
       joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       PRIMARY KEY (match_id, user_id)
     );
   `);
 
-  // transactions (wallet ledger)
   await q(`
     CREATE TABLE IF NOT EXISTS transactions (
       id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
       user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       amount NUMERIC(18,2) NOT NULL,
-      side TEXT NOT NULL,        -- debit | credit
-      reason TEXT NOT NULL,      -- deposit | withdraw | room_create | room_join | payout | refund | etc.
+      side TEXT NOT NULL,           -- debit | credit
+      reason TEXT NOT NULL,         -- deposit | withdraw | room_create | room_join | payout | refund | etc.
       meta JSONB NOT NULL DEFAULT '{}'::jsonb,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
 
-  console.log("✅ Migrations complete");
+  console.log('✅ Migrations complete');
 }
 
 /* =========================
-   Helper: ensure user & wallet
+   Helpers
    ========================= */
-async function ensureUserWithWallet(userIdMaybe) {
-  let userId = String(userIdMaybe || "").trim();
-
+async function ensureUserWithWallet(userIdMaybe){
+  let userId = String(userIdMaybe || '').trim();
   if (userId) {
-    // If provided, ensure it exists (if invalid UUID, SELECT will error — catch and create new)
-    const r = await q(`SELECT id FROM users WHERE id = $1::uuid`, [userId]).catch(() => null);
+    const r = await q(`SELECT id FROM users WHERE id=$1::uuid`, [userId]).catch(()=>null);
     if (!r || r.rowCount === 0) {
-      const rr = await q(`INSERT INTO users(id) VALUES ($1) ON CONFLICT DO NOTHING RETURNING id`, [userId]);
-      if (rr.rowCount === 0) {
-        // ID might be invalid UUID; create new
-        const rNew = await q(`INSERT INTO users DEFAULT VALUES RETURNING id`);
-        userId = rNew.rows[0].id;
-      }
+      const ins = await q(`INSERT INTO users(id) VALUES ($1) ON CONFLICT DO NOTHING RETURNING id`, [userId]);
+      if (ins.rowCount === 0) { const n = await q(`INSERT INTO users DEFAULT VALUES RETURNING id`); userId = n.rows[0].id; }
     }
   } else {
-    const rNew = await q(`INSERT INTO users DEFAULT VALUES RETURNING id`);
-    userId = rNew.rows[0].id;
+    const n = await q(`INSERT INTO users DEFAULT VALUES RETURNING id`); userId = n.rows[0].id;
   }
-
   await q(
     `INSERT INTO wallets (user_id, balance, currency)
      VALUES ($1, 0, 'USDT')
      ON CONFLICT (user_id) DO NOTHING`,
     [userId]
   );
-
   return userId;
 }
 
 /* =========================
-   Small helpers
-   ========================= */
-function toNumber(n, fallback = 0) {
-  const v = Number(n);
-  return Number.isFinite(v) ? v : fallback;
-}
-
-/* =========================
-   HTTP server
+   HTTP
    ========================= */
 const server = http.createServer(async (req, res) => {
   try {
     const { pathname, query } = url.parse(req.url, true);
 
-    // CORS (so you can test from anywhere)
-    if (req.method === "OPTIONS") {
+    // CORS
+    if (req.method === 'OPTIONS') {
       res.writeHead(204, {
-        "access-control-allow-origin": "*",
-        "access-control-allow-methods": "GET,POST,OPTIONS",
-        "access-control-allow-headers": "content-type",
-      });
-      return res.end();
+        'access-control-allow-origin': '*',
+        'access-control-allow-methods': 'GET,POST,OPTIONS',
+        'access-control-allow-headers': 'content-type',
+      }); return res.end();
     }
-    res.setHeader("access-control-allow-origin", "*");
+    res.setHeader('access-control-allow-origin', '*');
 
-    // health
-    if (pathname === "/health") {
-      return sendJson(res, 200, { ok: true, ts: Date.now() });
+    if (pathname === '/health') return sendJson(res, 200, { ok: true, ts: Date.now() });
+    if (pathname === '/db/health') {
+      const r = await q(`SELECT NOW() AS now`); return sendJson(res, 200, { ok: true, dbTime: r.rows[0].now });
     }
-
-    // db health
-    if (pathname === "/db/health") {
-      const r = await q(`SELECT NOW() AS now`);
-      return sendJson(res, 200, { ok: true, dbTime: r.rows[0].now });
+    if (pathname === '/tables') {
+      const r = await q(`SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY tablename`);
+      return sendJson(res, 200, { ok: true, tables: r.rows.map(x=>x.tablename) });
     }
 
-    // list tables
-    if (pathname === "/tables") {
-      const r = await q(`
-        SELECT tablename
-        FROM pg_tables
-        WHERE schemaname='public'
-        ORDER BY tablename ASC
-      `);
-      return sendJson(res, 200, { ok: true, tables: r.rows.map((x) => x.tablename) });
-    }
+    /* -------- Wallet: deposit (testing) -------- */
+    if (req.method === 'POST' && pathname === '/wallet/deposit') {
+      let b; try { b = await readJsonBody(req) } catch { return sendJson(res, 400, { ok:false, error:'invalid_json' }) }
+      const amount = toNumber(b.amount, NaN);
+      if (!Number.isFinite(amount) || amount <= 0) return sendJson(res, 400, { ok:false, error:'invalid_amount' });
+      const userId = await ensureUserWithWallet(b.userId);
 
-    // ---------- WALLET: DEPOSIT (for testing) ----------
-    if (req.method === "POST" && pathname === "/wallet/deposit") {
-      let body;
-      try { body = await readJsonBody(req); } catch (e) { return sendJson(res, 400, { ok: false, error: "invalid_json" }); }
-      const userIdIn = String(body.userId || "").trim();
-      const amount = toNumber(body.amount, NaN);
-      if (!Number.isFinite(amount) || amount <= 0) {
-        return sendJson(res, 400, { ok: false, error: "invalid_amount" });
-      }
-      const userId = await ensureUserWithWallet(userIdIn);
       const client = await pool.connect();
       try {
-        await client.query("BEGIN");
-        await client.query(
-          `UPDATE wallets SET balance = balance + $1, updated_at = NOW() WHERE user_id=$2`,
-          [amount, userId]
-        );
+        await client.query('BEGIN');
+        await client.query(`UPDATE wallets SET balance = balance + $1, updated_at=NOW() WHERE user_id=$2`, [amount, userId]);
         await client.query(
           `INSERT INTO transactions (user_id, amount, side, reason, meta)
-           VALUES ($1, $2, 'credit', 'deposit', '{}'::jsonb)`,
-          [userId, amount]
+           VALUES ($1,$2,'credit','deposit','{}'::jsonb)`, [userId, amount]
         );
-        await client.query("COMMIT");
-        const rBal = await q(`SELECT balance, currency FROM wallets WHERE user_id=$1`, [userId]);
-        return sendJson(res, 200, { ok: true, userId, wallet: rBal.rows[0] });
+        await client.query('COMMIT');
+        const w = await q(`SELECT balance, currency FROM wallets WHERE user_id=$1`, [userId]);
+        return sendJson(res, 200, { ok:true, userId, wallet: w.rows[0] });
       } catch (e) {
-        try { await client.query("ROLLBACK"); } catch {}
-        console.error("deposit error", e);
-        return sendJson(res, 500, { ok: false, error: e.message || "server_error" });
-      } finally {
-        client.release();
-      }
+        try { await client.query('ROLLBACK'); } catch {}
+        console.error('deposit error', e);
+        return sendJson(res, 500, { ok:false, error:'server_error' });
+      } finally { client.release(); }
     }
 
-    // ---------- ROOMS: CREATE ----------
-    if (req.method === "POST" && pathname === "/rooms/create") {
-      let body;
-      try { body = await readJsonBody(req); } catch (e) { return sendJson(res, 400, { ok: false, error: "invalid_json" }); }
+    /* -------- Rooms: CREATE (respects all new fields) -------- */
+    if (req.method === 'POST' && pathname === '/rooms/create') {
+      let b; try { b = await readJsonBody(req) } catch { return sendJson(res, 400, { ok:false, error:'invalid_json' }) }
 
-      const userIdIn   = String(body.userId || "").trim() || null;
-      const game       = String(body.game || "").trim() || "ludo";
-      const stake      = toNumber(body.stake, 0);
-      const maxPlayers = Number.isInteger(body.maxPlayers) ? body.maxPlayers : toNumber(body.maxPlayers, 2);
+      const userIdIn = b.userId;
+      const game     = (b.game || 'ludo').trim();
+      const stake    = toNumber(b.stake, 0);
 
-      if (!Number.isFinite(stake) || stake < 0) {
-        return sendJson(res, 400, { ok: false, error: "invalid_stake" });
-      }
-      if (!Number.isInteger(maxPlayers) || maxPlayers < 2 || maxPlayers > 8) {
-        return sendJson(res, 400, { ok: false, error: "invalid_maxPlayers" });
-      }
+      const maxPlayers = isInt(b.maxPlayers) ? b.maxPlayers : toNumber(b.maxPlayers, 2);
+      const mode       = (b.mode || 'h2h').trim();
+      const minPlayers = isInt(b.minPlayers) ? b.minPlayers : 2;
+      const autostart  = !!b.autostart;
+      const countdownSeconds   = isInt(b.countdownSeconds) ? b.countdownSeconds : 0;
+      const requireMutualReady = !!b.require_mutual_ready;
+      const config     = typeof b.config === 'object' && b.config ? b.config : {};
+
+      if (!isInt(maxPlayers) || maxPlayers < 2 || maxPlayers > 10)
+        return sendJson(res, 400, { ok:false, error:'invalid_maxPlayers' });
+      if (!isInt(minPlayers) || minPlayers < 2 || minPlayers > maxPlayers)
+        return sendJson(res, 400, { ok:false, error:'invalid_minPlayers' });
+      if (stake < 0) return sendJson(res, 400, { ok:false, error:'invalid_stake' });
 
       const userId = await ensureUserWithWallet(userIdIn);
 
-      // Optional: require balance >= stake to create room
-      const rWal = await q(`SELECT balance FROM wallets WHERE user_id=$1`, [userId]);
-      const bal = toNumber(rWal.rows[0]?.balance, 0);
-      if (bal < stake) {
-        return sendJson(res, 400, { ok: false, error: "insufficient_funds", balance: bal, needed: stake });
-      }
+      // (Optional) require host has balance >= stake
+      const w = await q(`SELECT balance FROM wallets WHERE user_id=$1`, [userId]);
+      const bal = toNumber(w.rows[0]?.balance, 0);
+      if (bal < stake) return sendJson(res, 400, { ok:false, error:'insufficient_funds', balance: bal, needed: stake });
 
       const client = await pool.connect();
       try {
-        await client.query("BEGIN");
+        await client.query('BEGIN');
 
+        // Debit host for stake (host buy-in)
         if (stake > 0) {
-          await client.query(
-            `UPDATE wallets SET balance = balance - $1, updated_at = NOW() WHERE user_id=$2`,
-            [stake, userId]
-          );
+          await client.query(`UPDATE wallets SET balance = balance - $1, updated_at=NOW() WHERE user_id=$2`, [stake, userId]);
           await client.query(
             `INSERT INTO transactions (user_id, amount, side, reason, meta)
-             VALUES ($1, $2, 'debit', 'room_create', jsonb_build_object('game',$3))`,
+             VALUES ($1,$2,'debit','room_create', jsonb_build_object('game',$3))`,
             [userId, stake, game]
           );
         }
 
+        // Create room using *exactly* what the client sent
         const rRoom = await client.query(
-          `INSERT INTO rooms (host_user_id, game, stake, max_players, current_players, status)
-           VALUES ($1, $2, $3, $4, 1, 'open')
-           RETURNING *`,
-          [userId, game, stake, maxPlayers]
+          `INSERT INTO rooms (
+              host_user_id, game, max_players, current_players, status,
+              mode, min_players, autostart, countdown_seconds, require_mutual_ready, config
+           ) VALUES ($1,$2,$3,1,'open',$4,$5,$6,$7,$8,$9::jsonb)
+           RETURNING id, created_at, host_user_id, game, max_players, current_players, status,
+                     mode, min_players, autostart, countdown_seconds, require_mutual_ready, config`,
+          [userId, game, maxPlayers, mode, minPlayers, autostart, countdownSeconds, requireMutualReady, JSON.stringify(config)]
+        );
+        const room = rRoom.rows[0];
+
+        // Create initial READY match for this room with the stake
+        const rMatch = await client.query(
+          `INSERT INTO matches (room_id, status, stake_amount, currency, game)
+           VALUES ($1,'ready',$2,'USDT',$3)
+           RETURNING id, stake_amount`,
+          [room.id, stake, game]
         );
 
-        await client.query("COMMIT");
-        return sendJson(res, 200, { ok: true, room: rRoom.rows[0] });
+        await client.query('COMMIT');
+
+        // API response mirrors what your app expects
+        return sendJson(res, 200, {
+          ok: true,
+          room: {
+            id: room.id,
+            host_user_id: room.host_user_id,
+            game: room.game,
+            stake: Number(rMatch.rows[0].stake_amount).toFixed(2),
+            max_players: room.max_players,
+            current_players: room.current_players,
+            status: room.status,
+            created_at: room.created_at,
+            mode: room.mode,
+            min_players: room.min_players,
+            autostart: room.autostart,
+            countdown_seconds: room.countdown_seconds,
+            require_mutual_ready: room.require_mutual_ready,
+            config: room.config
+          }
+        });
       } catch (e) {
-        try { await client.query("ROLLBACK"); } catch {}
-        console.error("rooms/create error", e);
-        return sendJson(res, 500, { ok: false, error: e.message || "server_error" });
-      } finally {
-        client.release();
-      }
+        try { await client.query('ROLLBACK'); } catch {}
+        console.error('rooms/create error', e);
+        return sendJson(res, 500, { ok:false, error:'server_error' });
+      } finally { client.release(); }
     }
 
-    // ---------- ROOMS: JOIN ----------
-    if (req.method === "POST" && pathname === "/rooms/join") {
-      let body;
-      try { body = await readJsonBody(req); } catch (e) { return sendJson(res, 400, { ok: false, error: "invalid_json" }); }
+    /* -------- Rooms: JOIN -------- */
+    if (req.method === 'POST' && pathname === '/rooms/join') {
+      let b; try { b = await readJsonBody(req) } catch { return sendJson(res, 400, { ok:false, error:'invalid_json' }) }
+      const roomId = String(b.roomId || '').trim();
+      const userIdIn = b.userId;
 
-      const roomId = String(body.roomId || "").trim();
-      const userIdIn = String(body.userId || "").trim() || null;
-
-      if (!roomId) {
-        return sendJson(res, 400, { ok: false, error: "missing_roomId" });
-      }
+      if (!roomId) return sendJson(res, 400, { ok:false, error:'missing_roomId' });
 
       const rRoom = await q(
-        `SELECT id, host_user_id, game, stake, max_players, current_players, status
-           FROM rooms WHERE id = $1`,
-        [roomId]
+        `SELECT id, host_user_id, game, max_players, current_players, status
+         FROM rooms WHERE id=$1`, [roomId]
       );
-      if (rRoom.rowCount === 0) {
-        return sendJson(res, 404, { ok: false, error: "room_not_found" });
-      }
+      if (rRoom.rowCount === 0) return sendJson(res, 404, { ok:false, error:'room_not_found' });
       const room = rRoom.rows[0];
-      if (room.status !== "open") {
-        return sendJson(res, 400, { ok: false, error: "room_not_open" });
-      }
-      if (room.current_players >= room.max_players) {
-        return sendJson(res, 400, { ok: false, error: "room_full" });
-      }
+      if (room.status !== 'open') return sendJson(res, 400, { ok:false, error:'room_not_open' });
+      if (room.current_players >= room.max_players) return sendJson(res, 400, { ok:false, error:'room_full' });
+
+      // Get current stake for this room from the READY match
+      const rStake = await q(
+        `SELECT stake_amount FROM matches
+          WHERE room_id=$1 AND status IN ('ready','waiting')
+          ORDER BY created_at DESC LIMIT 1`, [room.id]
+      );
+      const stakeNum = toNumber(rStake.rows[0]?.stake_amount, 0);
 
       const userId = await ensureUserWithWallet(userIdIn);
 
       const client = await pool.connect();
       try {
-        await client.query("BEGIN");
+        await client.query('BEGIN');
 
-        // Hold stake (if any)
-        const stakeNum = toNumber(room.stake, 0);
+        // Hold player stake
         if (stakeNum > 0) {
-          const rWal = await client.query(
-            `SELECT balance FROM wallets WHERE user_id=$1 FOR UPDATE`,
-            [userId]
-          );
-          const bal = toNumber(rWal.rows[0]?.balance, 0);
+          const w = await client.query(`SELECT balance FROM wallets WHERE user_id=$1 FOR UPDATE`, [userId]);
+          const bal = toNumber(w.rows[0]?.balance, 0);
           if (bal < stakeNum) {
-            await client.query("ROLLBACK");
-            return sendJson(res, 400, { ok: false, error: "insufficient_funds", balance: bal, needed: stakeNum });
+            await client.query('ROLLBACK');
+            return sendJson(res, 400, { ok:false, error:'insufficient_funds', balance: bal, needed: stakeNum });
           }
-
-          await client.query(
-            `UPDATE wallets SET balance = balance - $1, updated_at = NOW() WHERE user_id=$2`,
-            [stakeNum, userId]
-          );
+          await client.query(`UPDATE wallets SET balance = balance - $1, updated_at=NOW() WHERE user_id=$2`, [stakeNum, userId]);
           await client.query(
             `INSERT INTO transactions (user_id, amount, side, reason, meta)
-             VALUES ($1, $2, 'debit', 'room_join',
-                     jsonb_build_object('roomId',$3,'game',$4))`,
+             VALUES ($1,$2,'debit','room_join', jsonb_build_object('roomId',$3,'game',$4))`,
             [userId, stakeNum, room.id, room.game]
           );
         }
 
-        // Increment player count
+        // increment players
         const rUpd = await client.query(
           `UPDATE rooms
              SET current_players = current_players + 1
-           WHERE id = $1
-             AND current_players < max_players
-             AND status = 'open'
-           RETURNING id, game, stake, max_players, current_players, status`,
+           WHERE id=$1 AND current_players < max_players AND status='open'
+           RETURNING id, game, max_players, current_players, status`,
           [room.id]
         );
         if (rUpd.rowCount === 0) {
-          await client.query("ROLLBACK");
-          return sendJson(res, 400, { ok: false, error: "became_full_try_again" });
+          await client.query('ROLLBACK');
+          return sendJson(res, 400, { ok:false, error:'became_full_try_again' });
         }
         const updatedRoom = rUpd.rows[0];
 
-        // If filled, mark full + create a match entry
+        // If filled, mark full (match stays 'ready' until your game starts it)
         if (updatedRoom.current_players >= updatedRoom.max_players) {
           await client.query(`UPDATE rooms SET status='full' WHERE id=$1`, [room.id]);
-          await client.query(
-            `INSERT INTO matches (room_id, game, stake, status, started_at)
-             VALUES ($1, $2, $3, 'ready', NOW())`,
-            [room.id, room.game, stakeNum]
-          );
         }
 
-        await client.query("COMMIT");
+        await client.query('COMMIT');
 
         const rBal = await q(`SELECT balance FROM wallets WHERE user_id=$1`, [userId]);
         return sendJson(res, 200, {
           ok: true,
-          room: updatedRoom,
-          balance: toNumber(rBal.rows[0]?.balance, 0),
+          room: {
+            id: updatedRoom.id,
+            game: updatedRoom.game,
+            stake: stakeNum.toFixed(2),
+            max_players: updatedRoom.max_players,
+            current_players: updatedRoom.current_players,
+            status: updatedRoom.status
+          },
+          balance: toNumber(rBal.rows[0]?.balance, 0)
         });
       } catch (e) {
-        try { await client.query("ROLLBACK"); } catch {}
-        console.error("rooms/join error", e);
-        return sendJson(res, 500, { ok: false, error: e.message || "server_error" });
-      } finally {
-        client.release();
-      }
+        try { await client.query('ROLLBACK'); } catch {}
+        console.error('rooms/join error', e);
+        return sendJson(res, 500, { ok:false, error:'server_error' });
+      } finally { client.release(); }
     }
 
-    // ---------- ROOMS: LEAVE (simple refund if room is still open) ----------
-    if (req.method === "POST" && pathname === "/rooms/leave") {
-      let body;
-      try { body = await readJsonBody(req); } catch (e) { return sendJson(res, 400, { ok: false, error: "invalid_json" }); }
-
-      const roomId = String(body.roomId || "").trim();
-      const userIdIn = String(body.userId || "").trim() || null;
-      if (!roomId) return sendJson(res, 400, { ok: false, error: "missing_roomId" });
+    /* -------- Rooms: LEAVE (refund only if still open) -------- */
+    if (req.method === 'POST' && pathname === '/rooms/leave') {
+      let b; try { b = await readJsonBody(req) } catch { return sendJson(res, 400, { ok:false, error:'invalid_json' }) }
+      const roomId = String(b.roomId || '').trim();
+      const userId = await ensureUserWithWallet(b.userId);
+      if (!roomId) return sendJson(res, 400, { ok:false, error:'missing_roomId' });
 
       const rRoom = await q(`SELECT * FROM rooms WHERE id=$1`, [roomId]);
-      if (rRoom.rowCount === 0) return sendJson(res, 404, { ok: false, error: "room_not_found" });
+      if (rRoom.rowCount === 0) return sendJson(res, 404, { ok:false, error:'room_not_found' });
       const room = rRoom.rows[0];
-      if (room.status !== "open") return sendJson(res, 400, { ok: false, error: "room_not_open" });
+      if (room.status !== 'open') return sendJson(res, 400, { ok:false, error:'room_not_open' });
 
-      const userId = await ensureUserWithWallet(userIdIn);
+      // read stake from current ready/waiting match
+      const rStake = await q(
+        `SELECT stake_amount FROM matches
+         WHERE room_id=$1 AND status IN ('ready','waiting')
+         ORDER BY created_at DESC LIMIT 1`, [room.id]
+      );
+      const stakeNum = toNumber(rStake.rows[0]?.stake_amount, 0);
 
       const client = await pool.connect();
       try {
-        await client.query("BEGIN");
+        await client.query('BEGIN');
 
-        // Simple refund of stake if stake > 0 (we don't track per-room holds here)
-        const stakeNum = toNumber(room.stake, 0);
         if (stakeNum > 0) {
-          await client.query(
-            `UPDATE wallets SET balance = balance + $1, updated_at = NOW() WHERE user_id=$2`,
-            [stakeNum, userId]
-          );
+          await client.query(`UPDATE wallets SET balance = balance + $1, updated_at=NOW() WHERE user_id=$2`, [stakeNum, userId]);
           await client.query(
             `INSERT INTO transactions (user_id, amount, side, reason, meta)
-             VALUES ($1, $2, 'credit', 'refund', jsonb_build_object('roomId',$3))`,
+             VALUES ($1,$2,'credit','refund', jsonb_build_object('roomId',$3))`,
             [userId, stakeNum, room.id]
           );
         }
 
-        // Decrement player count but keep at minimum 1 (host)
         await client.query(
-          `UPDATE rooms
-             SET current_players = GREATEST(current_players - 1, 1)
-           WHERE id = $1`,
+          `UPDATE rooms SET current_players = GREATEST(current_players - 1, 1) WHERE id=$1`,
           [room.id]
         );
 
-        await client.query("COMMIT");
-        const rRoom2 = await q(`SELECT * FROM rooms WHERE id=$1`, [room.id]);
-        return sendJson(res, 200, { ok: true, room: rRoom2.rows[0] });
+        await client.query('COMMIT');
+        const r2 = await q(`SELECT * FROM rooms WHERE id=$1`, [room.id]);
+        return sendJson(res, 200, { ok:true, room: r2.rows[0] });
       } catch (e) {
-        try { await client.query("ROLLBACK"); } catch {}
-        console.error("rooms/leave error", e);
-        return sendJson(res, 500, { ok: false, error: e.message || "server_error" });
-      } finally {
-        client.release();
-      }
+        try { await client.query('ROLLBACK'); } catch {}
+        console.error('rooms/leave error', e);
+        return sendJson(res, 500, { ok:false, error:'server_error' });
+      } finally { client.release(); }
     }
 
-    // ---------- ROOMS: LIST ----------
-    if (req.method === "GET" && pathname === "/rooms/list") {
-      const status = String(query.status || "open");
+    /* -------- Rooms: LIST -------- */
+    if (req.method === 'GET' && pathname === '/rooms/list') {
+      const status = String(query.status || 'open');
       const r = await q(
-        `SELECT id, host_user_id, game, stake, max_players, current_players, status, created_at
+        `SELECT id, host_user_id, game, max_players, current_players, status,
+                mode, min_players, autostart, countdown_seconds, require_mutual_ready, config, created_at
            FROM rooms
-          WHERE status = $1
+          WHERE status=$1
           ORDER BY created_at DESC
-          LIMIT 100`,
-        [status]
+          LIMIT 100`, [status]
       );
-      return sendJson(res, 200, { ok: true, rooms: r.rows });
+      return sendJson(res, 200, { ok:true, rooms: r.rows });
     }
 
-    // default 404
-    return sendJson(res, 404, { ok: false, error: "not_found" });
+    return sendJson(res, 404, { ok:false, error:'not_found' });
   } catch (err) {
-    console.error("HTTP error:", err);
-    const msg = err?.kind === "invalid_json" ? "invalid_json" : "server_error";
-    return sendJson(res, 500, { ok: false, error: msg });
+    console.error('HTTP error:', err);
+    const msg = err?.kind === 'invalid_json' ? 'invalid_json' : 'server_error';
+    return sendJson(res, 500, { ok:false, error: msg });
   }
 });
 
 /* =========================
-   WebSocket (simple echo)
+   WebSocket
    ========================= */
 const wss = new WebSocketServer({ noServer: true });
-wss.on("connection", (ws) => {
-  ws.on("message", (m) => ws.send(String(m)));
-  ws.send("connected");
-});
-server.on("upgrade", (req, socket, head) => {
-  if (req.url === "/ws") {
-    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
-  } else {
-    socket.destroy();
-  }
+wss.on('connection', (ws)=>{ ws.on('message', m=> ws.send(String(m))); ws.send('connected'); });
+server.on('upgrade', (req, socket, head)=>{
+  if (req.url === '/ws') wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
+  else socket.destroy();
 });
 
 /* =========================
    Boot
    ========================= */
-(async () => {
-  try {
-    await pool.connect();
-    console.log("✅ Connected to Postgres");
+(async ()=>{
+  try{
+    await pool.connect(); console.log('✅ Connected to Postgres');
     await runMigrations();
-    server.listen(PORT, () => console.log(`✅ Server on :${PORT}`));
-  } catch (e) {
-    console.error("❌ Startup error", e);
-    process.exit(1);
+    server.listen(PORT, ()=> console.log(`✅ Server on :${PORT}`));
+  }catch(e){
+    console.error('❌ Startup error', e); process.exit(1);
   }
 })();
