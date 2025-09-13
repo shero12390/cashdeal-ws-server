@@ -395,191 +395,198 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 500, { ok:false, error:"server_error" });
       } finally { client.release(); }
     }
-/* ---------- ROOMS: LEAVE (refund if still open) ---------- */
-    if (req.method === "POST" && pathname === "/rooms/leave") {
-      let body; try { body = await readJsonBody(req); } catch { return sendJson(res, 400, { ok:false, error:"invalid_json" }); }
-      const roomId = String(body.roomId || "");
-      const userId = await ensureUserWithWallet(body.userId);
-      if (!roomId) return sendJson(res, 400, { ok:false, error:"missing_roomId" });
+/* ---------- ROOMS: LEAVE (no refund; 90s grace if match is live) ---------- */
+if (req.method === "POST" && pathname === "/rooms/leave") {
+  let body;
+  try { body = await readJsonBody(req); }
+  catch { return sendJson(res, 400, { ok:false, error:"invalid_json" }); }
 
-      const client = await pool.connect();
-      try {
-        await client.query("BEGIN");
-        const rRoom = await client.query(`SELECT * FROM rooms WHERE id=$1 FOR UPDATE`, [roomId]);
-        if (rRoom.rowCount === 0) { await client.query("ROLLBACK"); return sendJson(res, 404, { ok:false, error:"room_not_found" }); }
-        const room = rRoom.rows[0];
-        if (room.status !== "open") { await client.query("ROLLBACK"); return sendJson(res, 400, { ok:false, error:"room_not_open" }); }
+  const roomId  = String(body.roomId || "").trim();
+  const userId  = await ensureUserWithWallet(body.userId);
+  const GRACE_S = 90; // 90 seconds grace to rejoin
 
-        // remove from room_players
-        await client.query(`DELETE FROM room_players WHERE room_id=$1 AND user_id=$2`, [room.id, userId]);
+  if (!roomId) return sendJson(res, 400, { ok:false, error:"missing_roomId" });
 
-        // refund stake if > 0 (simple model)
-        const stake = n(room.stake, 0);
-        if (stake > 0) {
-          await client.query(`UPDATE wallets SET balance = balance + $1, updated_at = NOW() WHERE user_id=$2`, [stake, userId]);
-          const rBal2 = await client.query(`SELECT balance FROM wallets WHERE user_id=$1`, [userId]);
-          await client.query(
-            `INSERT INTO transactions (user_id, amount, reason, ref_match_id, balance_after)
-             VALUES ($1, $2, 'refund', NULL, $3)`,
-            [userId, stake, rBal2.rows[0].balance]
-          );
-        }
-
-        await client.query(
-          `UPDATE rooms SET current_players = GREATEST(current_players - 1, 1) WHERE id=$1`,
-          [room.id]
-        );
-
-        await client.query("COMMIT");
-        const rRoom2 = await q(`SELECT * FROM rooms WHERE id=$1`, [room.id]);
-        return sendJson(res, 200, { ok:true, room: rRoom2.rows[0] });
-      } catch (e) {
-        try { await client.query("ROLLBACK"); } catch {}
-        console.error("rooms/leave error", e);
-        return sendJson(res, 500, { ok:false, error:"server_error" });
-      } finally { client.release(); }
-    }
-
-    /* ---------- ROOMS: STATUS ---------- */
-    if (req.method === "GET" && pathname === "/rooms/status") {
-      const roomId = String(query.roomId || "").trim();
-      if (!roomId) return sendJson(res, 400, { ok:false, error:"missing_roomId" });
-
-      const rRoom = await q(`SELECT * FROM rooms WHERE id=$1`, [roomId]);
-      if (rRoom.rowCount === 0) return sendJson(res, 404, { ok:false, error:"room_not_found" });
-
-      const rPlayers = await q(
-        `SELECT user_id, ready, joined_at FROM room_players WHERE room_id=$1 ORDER BY joined_at ASC`,
-        [roomId]
-      );
-      return sendJson(res, 200, { ok:true, room: rRoom.rows[0], players: rPlayers.rows });
-    }
-
-    /* ---------- ROOMS: LIST ---------- */
-    if (req.method === "GET" && pathname === "/rooms/list") {
-      const status = String(query.status || "open");
-      const r = await q(
-        `SELECT id, host_user_id, game, stake, max_players, current_players, status,
-                created_at, mode, min_players, autostart, countdown_seconds, require_mutual_ready, config
-           FROM rooms
-          WHERE status=$1
-          ORDER BY created_at DESC
-          LIMIT 100`,
-        [status]
-      );
-      return sendJson(res, 200, { ok:true, rooms: r.rows });
-    }
-
-    /* ---------- MATCHES: FINISH ---------- */
-    if (req.method === "POST" && pathname === "/matches/finish") {
-      let body; try { body = await readJsonBody(req); } catch { return sendJson(res, 400, { ok:false, error:"invalid_json" }); }
-
-      const matchId = String(body.matchId || "").trim();
-      const results = Array.isArray(body.results) ? body.results : [];
-      if (!matchId || results.length === 0) return sendJson(res, 400, { ok:false, error:"missing_params" });
-
-      const rMatch = await q(
-        `SELECT id, room_id, game, stake, status FROM matches WHERE id=$1`,
-        [matchId]
-      );
-      if (rMatch.rowCount === 0) return sendJson(res, 404, { ok:false, error:"match_not_found" });
-      const match = rMatch.rows[0];
-      if (!["ready","running","live"].includes(match.status)) {
-        return sendJson(res, 400, { ok:false, error:"invalid_state", status: match.status });
-      }
-
-      const rPlayers = await q(`SELECT user_id FROM match_players WHERE match_id=$1`, [matchId]);
-      const playerIds = new Set(rPlayers.rows.map(r => String(r.user_id)));
-      const allowed = new Set(["won","lost","draw","cancelled"]);
-      const incoming = new Map(
-        results
-          .map(r => [String(r.userId || "").trim(), String(r.result || "").trim()])
-          .filter(([uid, res]) => uid && allowed.has(res))
-      );
-      if (incoming.size !== playerIds.size || [...playerIds].some(uid => !incoming.has(uid))) {
-        return sendJson(res, 400, { ok:false, error:"results_must_cover_all_players" });
-      }
-
-      const winners = [...incoming.entries()].filter(([,res]) => res === "won").map(([uid]) => uid);
-      const perPlayerStake = n(match.stake, 0);
-      const prizePool = perPlayerStake * playerIds.size;
-      const perWinner = winners.length > 0 ? prizePool / winners.length : 0;
-
-      const client = await pool.connect();
-      try {
-        await client.query("BEGIN");
-
-        // update match_players results
-        const vals = [...incoming.entries()];
-        const placeholders = vals.map((_, i) => `($${i*2+1}::uuid,$${i*2+2}::text)`).join(",");
-        await client.query(
-          `UPDATE match_players mp
-              SET result = v.res
-             FROM (VALUES ${placeholders}) AS v(uid,res)
-            WHERE mp.match_id = $${vals.length*2+1}::uuid
-              AND mp.user_id = v.uid`,
-          [...vals.flatMap(([uid,res]) => [uid,res]), matchId]
-        );
-
-        // credit winners
-        if (perWinner > 0 && winners.length > 0) {
-          for (const uid of winners) {
-            await client.query(`UPDATE wallets SET balance = balance + $1, updated_at = NOW() WHERE user_id=$2`, [perWinner, uid]);
-            const rBal = await client.query(`SELECT balance FROM wallets WHERE user_id=$1`, [uid]);
-            await client.query(
-              `INSERT INTO transactions (user_id, amount, reason, ref_match_id, balance_after)
-               VALUES ($1, $2, 'payout', $3, $4)`,
-              [uid, perWinner, matchId, rBal.rows[0].balance]
-            );
-          }
-        }
-
-        await client.query(`UPDATE matches SET status='finished', ended_at = NOW() WHERE id=$1`, [matchId]);
-        if (match.room_id) await client.query(`UPDATE rooms SET status='closed' WHERE id=$1`, [match.room_id]);
-
-        await client.query("COMMIT");
-      } catch (e) {
-        try { await client.query("ROLLBACK"); } catch {}
-        console.error("matches/finish error", e);
-        return sendJson(res, 500, { ok:false, error:"server_error" });
-      } finally { client.release(); }
-
-      const rDone = await q(
-        `SELECT id, room_id, game, stake, status, started_at, ended_at FROM matches WHERE id=$1`,
-        [matchId]
-      );
-      return sendJson(res, 200, { ok:true, match: rDone.rows[0], payouts: (perWinner>0 ? { winners, perWinner } : null) });
-    }
-
-    return sendJson(res, 404, { ok:false, error:"not_found" });
-  } catch (e) {
-    console.error("HTTP error", e);
-    return sendJson(res, 500, { ok:false, error:"server_error" });
-  }
-});
-
-/* =========================
-   WebSocket & Boot
-   ========================= */
-const wss = new WebSocketServer({ noServer: true });
-wss.on("connection", (ws) => {
-  ws.on("message", (m) => ws.send(String(m)));
-  ws.send("connected");
-});
-server.on("upgrade", (req, socket, head) => {
-  if (req.url === "/ws") {
-    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
-  } else socket.destroy();
-});
-
-(async () => {
+  const client = await pool.connect();
   try {
-    await pool.connect();
-    console.log("✅ connected to Postgres");
-    await runMigrations();
-    server.listen(PORT, () => console.log(`✅ server listening on :${PORT}`));
+    await client.query("BEGIN");
+
+    const rRoom = await client.query(`SELECT * FROM rooms WHERE id=$1 FOR UPDATE`, [roomId]);
+    if (rRoom.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return sendJson(res, 404, { ok:false, error:"room_not_found" });
+    }
+    const room = rRoom.rows[0];
+
+    const rMatch = await client.query(
+      `SELECT id, status, stake FROM matches
+        WHERE room_id=$1 AND status IN ('ready','running','live','in_play')
+        ORDER BY created_at DESC LIMIT 1`,
+      [room.id]
+    );
+
+    if (rMatch.rowCount > 0) {
+      const match = rMatch.rows[0];
+
+      const rMP = await client.query(
+        `SELECT match_id, user_id FROM match_players
+          WHERE match_id=$1 AND user_id=$2 FOR UPDATE`,
+        [match.id, userId]
+      );
+
+      if (rMP.rowCount === 0) {
+        await client.query("COMMIT");
+        return sendJson(res, 200, { ok:true, note:"not_in_match", room, matchId: match.id });
+      }
+
+      const rGrace = await client.query(
+        `UPDATE match_players
+            SET left_at = NOW(),
+                grace_until = NOW() + make_interval(secs => $1)
+          WHERE match_id=$2 AND user_id=$3
+          RETURNING left_at, grace_until`,
+        [GRACE_S, match.id, userId]
+      );
+
+      await client.query("COMMIT");
+      return sendJson(res, 200, {
+        ok: true,
+        note: "left_temporarily_no_refund",
+        roomStatus: room.status,
+        matchId: match.id,
+        grace: rGrace.rows[0]
+      });
+    }
+
+    // No active match yet
+    await client.query(
+      `DELETE FROM room_players WHERE room_id=$1 AND user_id=$2`,
+      [room.id, userId]
+    ).catch(() => null);
+
+    await client.query(
+      `UPDATE rooms
+          SET current_players = GREATEST(current_players - 1, 0)
+        WHERE id=$1`,
+      [room.id]
+    );
+
+    await client.query("COMMIT");
+    const rAfter = await q(`SELECT * FROM rooms WHERE id=$1`, [room.id]);
+    return sendJson(res, 200, { ok: true, note: "left_lobby_no_refund", room: rAfter.rows[0] });
   } catch (e) {
-    console.error("❌ startup error", e);
-    process.exit(1);
+    try { await client.query("ROLLBACK"); } catch {}
+    console.error("rooms/leave error", e);
+    return sendJson(res, 500, { ok:false, error:"server_error" });
+  } finally {
+    client.release();
   }
-})();
+}
+
+/* ---------- ROOMS: STATUS ---------- */
+if (req.method === "GET" && pathname === "/rooms/status") {
+  const roomId = String(query.roomId || "").trim();
+  if (!roomId) return sendJson(res, 400, { ok:false, error:"missing_roomId" });
+
+  const rRoom = await q(`SELECT * FROM rooms WHERE id=$1`, [roomId]);
+  if (rRoom.rowCount === 0) return sendJson(res, 404, { ok:false, error:"room_not_found" });
+
+  const rPlayers = await q(
+    `SELECT user_id, ready, joined_at, left_at, grace_until
+       FROM match_players WHERE match_id IN
+         (SELECT id FROM matches WHERE room_id=$1 ORDER BY created_at DESC LIMIT 1)
+       ORDER BY joined_at ASC`,
+    [roomId]
+  );
+  return sendJson(res, 200, { ok:true, room: rRoom.rows[0], players: rPlayers.rows });
+}
+
+/* ---------- ROOMS: LIST ---------- */
+if (req.method === "GET" && pathname === "/rooms/list") {
+  const status = String(query.status || "open");
+  const r = await q(
+    `SELECT id, host_user_id, game, stake, max_players, current_players, status,
+            created_at, mode, min_players, autostart, countdown_seconds,
+            require_mutual_ready, config
+       FROM rooms
+      WHERE status=$1
+      ORDER BY created_at DESC
+      LIMIT 100`,
+    [status]
+  );
+  return sendJson(res, 200, { ok:true, rooms: r.rows });
+}
+
+/* ---------- MATCHES: FINISH ---------- */
+if (req.method === "POST" && pathname === "/matches/finish") {
+  let body; try { body = await readJsonBody(req); }
+  catch { return sendJson(res, 400, { ok:false, error:"invalid_json" }); }
+
+  const matchId = String(body.matchId || "").trim();
+  const results = Array.isArray(body.results) ? body.results : [];
+  if (!matchId || results.length === 0)
+    return sendJson(res, 400, { ok:false, error:"missing_params" });
+
+  const rMatch = await q(`SELECT id, room_id, game, stake, status FROM matches WHERE id=$1`, [matchId]);
+  if (rMatch.rowCount === 0) return sendJson(res, 404, { ok:false, error:"match_not_found" });
+  const match = rMatch.rows[0];
+  if (!["ready","running","live","in_play"].includes(match.status))
+    return sendJson(res, 400, { ok:false, error:"invalid_state", status: match.status });
+
+  const rPlayers = await q(`SELECT user_id FROM match_players WHERE match_id=$1`, [matchId]);
+  const playerIds = new Set(rPlayers.rows.map(r => String(r.user_id)));
+
+  const allowed = new Set(["won","lost","draw","cancelled"]);
+  const incoming = new Map(
+    results
+      .map(r => [String(r.userId || "").trim(), String(r.result || "").trim()])
+      .filter(([uid,res]) => uid && allowed.has(res))
+  );
+  if (incoming.size !== playerIds.size || [...playerIds].some(uid => !incoming.has(uid)))
+    return sendJson(res, 400, { ok:false, error:"results_must_cover_all_players" });
+
+  const winners = [...incoming.entries()].filter(([,res]) => res === "won").map(([uid]) => uid);
+  const perPlayerStake = n(match.stake, 0);
+  const prizePool = perPlayerStake * playerIds.size;
+  const perWinner = winners.length > 0 ? prizePool / winners.length : 0;
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const vals = [...incoming.entries()];
+    const placeholders = vals.map((_,i)=>`($${i*2+1}::uuid,$${i*2+2}::text)`).join(",");
+    await client.query(
+      `UPDATE match_players mp
+          SET result = v.res
+         FROM (VALUES ${placeholders}) AS v(uid,res)
+        WHERE mp.match_id = $${vals.length*2+1}::uuid
+          AND mp.user_id = v.uid`,
+      [...vals.flatMap(([uid,res])=>[uid,res]), matchId]
+    );
+
+    if (perWinner > 0 && winners.length > 0) {
+      for (const uid of winners) {
+        await client.query(`UPDATE wallets SET balance = balance + $1, updated_at = NOW() WHERE user_id=$2`, [perWinner, uid]);
+        const rBal = await client.query(`SELECT balance FROM wallets WHERE user_id=$1`, [uid]);
+        await client.query(
+          `INSERT INTO transactions (user_id, amount, reason, ref_match_id, balance_after)
+           VALUES ($1,$2,'payout',$3,$4)`,
+          [uid, perWinner, matchId, rBal.rows[0].balance]
+        );
+      }
+    }
+
+    await client.query(`UPDATE matches SET status='finished', ended_at=NOW() WHERE id=$1`, [matchId]);
+    if (match.room_id) await client.query(`UPDATE rooms SET status='closed' WHERE id=$1`, [match.room_id]);
+
+    await client.query("COMMIT");
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch {}
+    console.error("matches/finish error", e);
+    return sendJson(res, 500, { ok:false, error:"server_error" });
+  } finally { client.release(); }
+
+  const rDone = await q(`SELECT id, room_id, game, stake, status, started_at, ended_at FROM matches WHERE id=$1`, [matchId]);
+  return sendJson(res, 200, { ok:true, match: rDone.rows[0], payouts: (perWinner>0 ? { winners, perWinner } : null) });
+}
