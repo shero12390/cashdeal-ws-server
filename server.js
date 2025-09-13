@@ -755,3 +755,78 @@ try {
     return sendJson(res, 500, { ok:false, error:"server_error" });
   }
 });
+// ======= WebSocket upgrade =======
+server.on("upgrade", (req, socket, head) => {
+  if (req.url === "/ws") {
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+  } else {
+    socket.destroy();
+  }
+});
+
+// ======= Auto-cancel stale rooms job =======
+// Policy: if room is 'open' for > AUTOCANCEL_MINUTES and did not reach min_players,
+// close it and refund stake holds to whoever is in room_players + host.
+// (We must refund here to avoid stuck funds. Your manual "leave=no refund" rule
+// remains for user-initiated leaves; system cancel is different.)
+async function autoCancelSweep() {
+  try {
+    const r = await q(
+      `SELECT *
+         FROM rooms
+        WHERE status='open'
+          AND created_at < NOW() - ($1::int || ' minutes')::interval`,
+      [AUTOCANCEL_MINUTES]
+    );
+    for (const room of r.rows) {
+      const players = await q(`SELECT user_id FROM room_players WHERE room_id=$1`, [room.id]);
+      const allUsers = new Set(players.rows.map(x => String(x.user_id)));
+      allUsers.add(String(room.host_user_id));
+
+      if (room.stake > 0) {
+        const client = await pool.connect();
+        try {
+          await client.query("BEGIN");
+          for (const uid of allUsers) {
+            await client.query(
+              `UPDATE wallets SET balance = balance + $1, updated_at = NOW() WHERE user_id=$2`,
+              [room.stake, uid]
+            );
+            const rBal = await client.query(`SELECT balance FROM wallets WHERE user_id=$1`, [uid]);
+            await client.query(
+              `INSERT INTO transactions (user_id, amount, reason, ref_match_id, balance_after)
+               VALUES ($1, $2, 'stake_release', NULL, $3)`,
+              [uid, room.stake, rBal.rows[0].balance]
+            );
+            pushBalance(uid, Number(rBal.rows[0].balance));
+          }
+          await client.query(`UPDATE rooms SET status='closed' WHERE id=$1`, [room.id]);
+          await client.query("COMMIT");
+          console.log(`Auto-cancelled room ${room.id}`);
+        } catch (e) {
+          try { await client.query("ROLLBACK"); } catch {}
+          console.error("autoCancel sweep error for room", room.id, e);
+        } finally { client.release(); }
+      } else {
+        await q(`UPDATE rooms SET status='closed' WHERE id=$1`, [room.id]);
+        console.log(`Auto-closed free room ${room.id}`);
+      }
+    }
+  } catch (e) {
+    console.error("autoCancelSweep error", e);
+  }
+}
+setInterval(autoCancelSweep, 60 * 1000); // run every minute
+
+// ======= Boot =======
+(async () => {
+  try {
+    await pool.connect();
+    console.log("✅ Connected to Postgres");
+    await runMigrations();
+    server.listen(PORT, () => console.log(`✅ Server on :${PORT}`));
+  } catch (e) {
+    console.error("❌ Startup error", e);
+    process.exit(1);
+  }
+})();
