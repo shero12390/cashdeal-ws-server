@@ -6,6 +6,7 @@ const { WebSocketServer } = require("ws");
 const { Pool } = require("pg");
 
 const PORT = process.env.PORT || 3000;
+const SYNC_SECRET = process.env.SYNC_SECRET || "superStrongSecret123"; // set in Render
 
 /* =========================
    Postgres
@@ -24,24 +25,38 @@ function sendJson(res, code, obj) {
   });
   res.end(JSON.stringify(obj));
 }
-
 async function readJsonBody(req) {
   return new Promise((resolve, reject) => {
     let data = "";
     req.on("data", (c) => (data += c));
     req.on("end", () => {
       if (!data) return resolve({});
-      try { resolve(JSON.parse(data)); }
-      catch { reject(new Error("invalid_json")); }
+      try { resolve(JSON.parse(data)); } catch { reject(new Error("invalid_json")); }
     });
     req.on("error", reject);
   });
 }
-
 function n(v, f = 0) { const x = Number(v); return Number.isFinite(x) ? x : f; }
 
 /* =========================
-   Migrations
+   Realtime wallet updates (WS registry + helpers)
+   ========================= */
+const userSockets = new Map(); // Map<userId, Set<WebSocket>>
+
+function broadcastTo(userId, data) {
+  const set = userSockets.get(String(userId));
+  if (!set) return;
+  const msg = JSON.stringify(data);
+  for (const ws of set) { try { ws.send(msg); } catch {} }
+}
+async function pushWalletUpdate(userId) {
+  const r = await q(`SELECT balance, currency FROM wallets WHERE user_id=$1`, [userId]);
+  const wallet = r.rows[0] || { balance: 0, currency: "USDT" };
+  broadcastTo(userId, { type: "wallet:update", userId, wallet });
+}
+
+/* =========================
+   Migrations (aligned to your DB)
    ========================= */
 async function runMigrations() {
   await q(`CREATE EXTENSION IF NOT EXISTS "uuid-ossp";`);
@@ -71,7 +86,7 @@ async function runMigrations() {
       stake NUMERIC(18,2) NOT NULL DEFAULT 0,
       max_players INT NOT NULL CHECK (max_players >= 2 AND max_players <= 10),
       current_players INT NOT NULL DEFAULT 1,
-      status TEXT NOT NULL DEFAULT 'open',
+      status TEXT NOT NULL DEFAULT 'open',  -- open | locked | in_play | full | closed
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       mode TEXT NOT NULL DEFAULT 'h2h',
       min_players INT NOT NULL DEFAULT 2,
@@ -101,7 +116,8 @@ async function runMigrations() {
       stake NUMERIC(18,2) NOT NULL DEFAULT 0,
       status TEXT NOT NULL DEFAULT 'ready', -- ready | running | live | finished | cancelled
       started_at TIMESTAMPTZ,
-      ended_at TIMESTAMPTZ
+      ended_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
 
@@ -188,7 +204,43 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { ok: true, dbTime: r.rows[0].now });
     }
 
-    // ---------- WALLET: DEPOSIT (testing only) ----------
+    // ---------- INTERNAL: WALLET SYNC (from Firebase reviewer) ----------
+    if (req.method === "POST" && pathname === "/internal/wallet/sync") {
+      // secure with header secret
+      const hdr = (req.headers["x-sync-secret"] || "").toString();
+      if (hdr !== SYNC_SECRET) return sendJson(res, 401, { ok:false, error:"unauthorized" });
+
+      let body; try { body = await readJsonBody(req); } catch { return sendJson(res, 400, { ok:false, error:"invalid_json" }); }
+      const uid = await ensureUserWithWallet(body.uid);
+      const newBalance = n(body.balance, NaN);
+      if (!Number.isFinite(newBalance) || newBalance < 0) return sendJson(res, 400, { ok:false, error:"invalid_balance" });
+
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        await client.query(
+          `UPDATE wallets SET balance=$1, updated_at=NOW() WHERE user_id=$2`,
+          [newBalance, uid]
+        );
+        await client.query(
+          `INSERT INTO transactions (user_id, amount, reason, ref_match_id, balance_after)
+           VALUES ($1, $2, 'deposit', NULL, $3)`,
+          [uid, 0, newBalance] // amount 0: this is a sync reflect; ledger snapshot only
+        );
+        await client.query("COMMIT");
+      } catch (e) {
+        try { await client.query("ROLLBACK"); } catch {}
+        console.error("wallet/sync error", e);
+        return sendJson(res, 500, { ok:false, error:"server_error" });
+      } finally {
+        client.release();
+      }
+
+      await pushWalletUpdate(uid);
+      return sendJson(res, 200, { ok:true });
+    }
+
+    // ---------- WALLET: DEPOSIT (local test only) ----------
     if (req.method === "POST" && pathname === "/wallet/deposit") {
       let body;
       try { body = await readJsonBody(req); }
@@ -199,64 +251,31 @@ const server = http.createServer(async (req, res) => {
       if (!Number.isFinite(amount) || amount <= 0) {
         return sendJson(res, 400, { ok: false, error: "invalid_amount" });
       }
-
       const userId = await ensureUserWithWallet(userIdIn);
 
       const client = await pool.connect();
       try {
         await client.query("BEGIN");
-
         await client.query(
           `UPDATE wallets SET balance = balance + $1, updated_at = NOW()
            WHERE user_id = $2`,
           [amount, userId]
         );
-
-        const rBal = await client.query(
-          `SELECT balance FROM wallets WHERE user_id=$1`,
-          [userId]
-        );
+        const rBal = await client.query(`SELECT balance FROM wallets WHERE user_id=$1`, [userId]);
         const newBal = Number(rBal.rows[0]?.balance ?? 0);
-
         await client.query(
           `INSERT INTO transactions (user_id, amount, reason, ref_match_id, balance_after)
            VALUES ($1, $2, 'deposit', NULL, $3)`,
           [userId, amount, newBal]
         );
-
         await client.query("COMMIT");
-        return sendJson(res, 200, {
-          ok: true,
-          userId,
-          wallet: { balance: newBal, currency: "USDT" }
-        });
+        await pushWalletUpdate(userId);
+        return sendJson(res, 200, { ok: true, userId, wallet: { balance: newBal, currency: "USDT" } });
       } catch (e) {
         try { await client.query("ROLLBACK"); } catch {}
         console.error("deposit error", e);
         return sendJson(res, 500, { ok: false, error: "server_error" });
-      } finally {
-        client.release();
-      }
-    }
-
-    /* ---------- INTERNAL: WALLET SYNC (Firebase -> Render) ---------- */
-    if (req.method === "POST" && pathname === "/internal/wallet/sync") {
-      if (req.headers["x-sync-secret"] !== process.env.SYNC_SECRET) {
-        return sendJson(res, 401, { ok:false, error:"unauthorized" });
-      }
-      let body; try { body = await readJsonBody(req); }
-      catch { return sendJson(res, 400, { ok:false, error:"invalid_json" }); }
-
-      const uid = String(body.uid || body.userId || "").trim();
-      const balance = Number(body.balance);
-
-      if (!uid || !Number.isFinite(balance)) {
-        return sendJson(res, 400, { ok:false, error:"bad_params" });
-      }
-
-      const userId = await ensureUserWithWallet(uid);
-      await q(`UPDATE wallets SET balance=$1, updated_at=NOW() WHERE user_id=$2`, [balance, userId]);
-      return sendJson(res, 200, { ok:true });
+      } finally { client.release(); }
     }
 
     /* ---------- ROOMS: CREATE ---------- */
@@ -311,6 +330,7 @@ const server = http.createServer(async (req, res) => {
         );
 
         await client.query("COMMIT");
+        await pushWalletUpdate(userId); // host stake hold (if any)
         return sendJson(res, 200, { ok:true, room: rRoom.rows[0] });
       } catch (e) {
         try { await client.query("ROLLBACK"); } catch {}
@@ -366,6 +386,7 @@ const server = http.createServer(async (req, res) => {
 
         await client.query("COMMIT");
         const rBal = await q(`SELECT balance FROM wallets WHERE user_id=$1`, [userId]);
+        await pushWalletUpdate(userId); // stake hold visible
         return sendJson(res, 200, { ok:true, room: rUpd.rows[0], balance: n(rBal.rows[0]?.balance, 0) });
       } catch (e) {
         try { await client.query("ROLLBACK"); } catch {}
@@ -440,9 +461,10 @@ const server = http.createServer(async (req, res) => {
       } finally { client.release(); }
     }
 
-    /* ---------- ROOMS: REJOIN (only within grace) ---------- */
+    /* ---------- ROOMS: REJOIN (only within grace window) ---------- */
     if (req.method === "POST" && pathname === "/rooms/rejoin") {
-      let body; try { body = await readJsonBody(req); }
+      let body;
+      try { body = await readJsonBody(req); }
       catch { return sendJson(res, 400, { ok:false, error:"invalid_json" }); }
 
       const roomId = String(body.roomId || "").trim();
@@ -492,24 +514,29 @@ const server = http.createServer(async (req, res) => {
         );
 
         await client.query("COMMIT");
-        return sendJson(res, 200, { ok:true, note:"rejoined_success", roomStatus: room.status, matchId: match.id });
+        return sendJson(res, 200, { ok: true, note: "rejoined_success", roomStatus: room.status, matchId: match.id });
       } catch (e) {
         try { await client.query("ROLLBACK"); } catch {}
         console.error("rooms/rejoin error", e);
         return sendJson(res, 500, { ok:false, error:"server_error" });
-      } finally { client.release(); }
+      } finally {
+        client.release();
+      }
     }
 
-  /* ---------- ROOMS: LEAVE (no refund; 90s grace) ---------- */
+    /* ---------- ROOMS: LEAVE (no refund; 90s grace if match is live) ---------- */
     if (req.method === "POST" && pathname === "/rooms/leave") {
-      let body; try { body = await readJsonBody(req); }
+      let body;
+      try { body = await readJsonBody(req); }
       catch { return sendJson(res, 400, { ok:false, error:"invalid_json" }); }
 
       const roomId  = String(body.roomId || "").trim();
       const userId  = await ensureUserWithWallet(body.userId);
       const GRACE_S = 90;
+
       if (!roomId) return sendJson(res, 400, { ok:false, error:"missing_roomId" });
-const client = await pool.connect();
+
+      const client = await pool.connect();
       try {
         await client.query("BEGIN");
 
@@ -519,19 +546,19 @@ const client = await pool.connect();
 
         // active match?
         const rMatch = await client.query(
-          `SELECT id, status, stake FROM matches
-           WHERE room_id=$1 AND status IN ('ready','running','live','in_play')
-           ORDER BY created_at DESC LIMIT 1`,
+          `SELECT id, status FROM matches
+            WHERE room_id=$1 AND status IN ('ready','running','live','in_play')
+            ORDER BY created_at DESC LIMIT 1`,
           [room.id]
         );
 
         if (rMatch.rowCount > 0) {
           const match = rMatch.rows[0];
 
-          // mark temp leave (no refund)
           const rMP = await client.query(
             `SELECT match_id, user_id FROM match_players
-             WHERE match_id=$1 AND user_id=$2 FOR UPDATE`,
+              WHERE match_id=$1 AND user_id=$2
+              FOR UPDATE`,
             [match.id, userId]
           );
           if (rMP.rowCount === 0) {
@@ -539,53 +566,53 @@ const client = await pool.connect();
             return sendJson(res, 200, { ok:true, note:"not_in_match", room, matchId: match.id });
           }
 
-          const rGrace = await client.query(
+          await client.query(
             `UPDATE match_players
-               SET left_at = NOW(),
-                   grace_until = NOW() + make_interval(secs => $1)
-             WHERE match_id=$2 AND user_id=$3
-             RETURNING left_at, grace_until`,
+                SET left_at = NOW(),
+                    grace_until = NOW() + make_interval(secs => $1),
+                    result = CASE WHEN result = 'pending' THEN result ELSE result END
+              WHERE match_id=$2 AND user_id=$3`,
             [GRACE_S, match.id, userId]
           );
 
           await client.query("COMMIT");
           return sendJson(res, 200, {
-            ok:true,
-            note:"left_temporarily_no_refund",
+            ok: true,
+            note: "left_temporarily_no_refund",
             roomStatus: room.status,
-            matchId: match.id,
-            grace: rGrace.rows[0]
+            matchId: match.id
           });
         }
 
-        // no active match: leaving lobby (no refund), adjust counters
-        await client.query(`DELETE FROM room_players WHERE room_id=$1 AND user_id=$2`, [room.id, userId]).catch(()=>null);
+        // lobby leave (no refund), decrement count
         await client.query(
-          `UPDATE rooms SET current_players = GREATEST(current_players - 1, 0)
-           WHERE id=$1`,
+          `DELETE FROM room_players WHERE room_id=$1 AND user_id=$2`,
+          [room.id, userId]
+        ).catch(() => null);
+
+        await client.query(
+          `UPDATE rooms
+              SET current_players = GREATEST(current_players - 1, 0)
+            WHERE id=$1`,
           [room.id]
         );
 
         await client.query("COMMIT");
         const rAfter = await q(`SELECT * FROM rooms WHERE id=$1`, [room.id]);
-        return sendJson(res, 200, { ok:true, note:"left_lobby_no_refund", room: rAfter.rows[0] });
+        return sendJson(res, 200, { ok: true, note: "left_lobby_no_refund", room: rAfter.rows[0] });
       } catch (e) {
         try { await client.query("ROLLBACK"); } catch {}
         console.error("rooms/leave error", e);
         return sendJson(res, 500, { ok:false, error:"server_error" });
-      } finally {
-        client.release();
-      }
+      } finally { client.release(); }
     }
 
     /* ---------- ROOMS: STATUS ---------- */
     if (req.method === "GET" && pathname === "/rooms/status") {
       const roomId = String(query.roomId || "").trim();
       if (!roomId) return sendJson(res, 400, { ok:false, error:"missing_roomId" });
-
       const rRoom = await q(`SELECT * FROM rooms WHERE id=$1`, [roomId]);
       if (rRoom.rowCount === 0) return sendJson(res, 404, { ok:false, error:"room_not_found" });
-
       const rPlayers = await q(
         `SELECT user_id, ready, joined_at FROM room_players WHERE room_id=$1 ORDER BY joined_at ASC`,
         [roomId]
@@ -599,10 +626,10 @@ const client = await pool.connect();
       const r = await q(
         `SELECT id, host_user_id, game, stake, max_players, current_players, status,
                 created_at, mode, min_players, autostart, countdown_seconds, require_mutual_ready, config
-         FROM rooms
-         WHERE status=$1
-         ORDER BY created_at DESC
-         LIMIT 100`,
+           FROM rooms
+          WHERE status=$1
+          ORDER BY created_at DESC
+          LIMIT 100`,
         [status]
       );
       return sendJson(res, 200, { ok:true, rooms: r.rows });
@@ -616,10 +643,13 @@ const client = await pool.connect();
       const results = Array.isArray(body.results) ? body.results : [];
       if (!matchId || results.length === 0) return sendJson(res, 400, { ok:false, error:"missing_params" });
 
-      const rMatch = await q(`SELECT id, room_id, game, stake, status FROM matches WHERE id=$1`, [matchId]);
+      const rMatch = await q(
+        `SELECT id, room_id, game, stake, status FROM matches WHERE id=$1`,
+        [matchId]
+      );
       if (rMatch.rowCount === 0) return sendJson(res, 404, { ok:false, error:"match_not_found" });
       const match = rMatch.rows[0];
-      if (!["ready","running","live"].includes(match.status)) {
+      if (!["ready","running","live","in_play"].includes(match.status)) {
         return sendJson(res, 400, { ok:false, error:"invalid_state", status: match.status });
       }
 
@@ -644,6 +674,7 @@ const client = await pool.connect();
       try {
         await client.query("BEGIN");
 
+        // update match_players results
         const vals = [...incoming.entries()];
         const placeholders = vals.map((_, i) => `($${i*2+1}::uuid,$${i*2+2}::text)`).join(",");
         await client.query(
@@ -655,6 +686,7 @@ const client = await pool.connect();
           [...vals.flatMap(([uid,res]) => [uid,res]), matchId]
         );
 
+        // credit winners
         if (perWinner > 0 && winners.length > 0) {
           for (const uid of winners) {
             await client.query(`UPDATE wallets SET balance = balance + $1, updated_at = NOW() WHERE user_id=$2`, [perWinner, uid]);
@@ -677,6 +709,12 @@ const client = await pool.connect();
         return sendJson(res, 500, { ok:false, error:"server_error" });
       } finally { client.release(); }
 
+      // Notify winners (their balance changed)
+      if (perWinner > 0 && winners.length > 0) {
+        const uniq = Array.from(new Set(winners));
+        for (const uid of uniq) { try { await pushWalletUpdate(uid); } catch {} }
+      }
+
       const rDone = await q(
         `SELECT id, room_id, game, stake, status, started_at, ended_at FROM matches WHERE id=$1`,
         [matchId]
@@ -684,7 +722,6 @@ const client = await pool.connect();
       return sendJson(res, 200, { ok:true, match: rDone.rows[0], payouts: (perWinner>0 ? { winners, perWinner } : null) });
     }
 
-    // fallback
     return sendJson(res, 404, { ok:false, error:"not_found" });
   } catch (e) {
     console.error("HTTP error", e);
@@ -693,19 +730,40 @@ const client = await pool.connect();
 });
 
 /* =========================
-   WebSocket & Boot
+   WebSocket (bind by ?userId=...)
    ========================= */
 const wss = new WebSocketServer({ noServer: true });
-wss.on("connection", (ws) => {
+wss.on("connection", (ws, req) => {
+  const { query } = url.parse(req.url, true);
+  const uid = String(query.userId || "").trim();
+
+  if (uid) {
+    let set = userSockets.get(uid);
+    if (!set) userSockets.set(uid, (set = new Set()));
+    set.add(ws);
+    ws.on("close", () => {
+      set.delete(ws);
+      if (set.size === 0) userSockets.delete(uid);
+    });
+    // Snapshot on connect
+    pushWalletUpdate(uid).catch(() => {});
+  }
+
+  // echo for diagnostics
   ws.on("message", (m) => ws.send(String(m)));
   ws.send("connected");
 });
 server.on("upgrade", (req, socket, head) => {
-  if (req.url === "/ws") {
+  if (req.url.startsWith("/ws")) {
     wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
-  } else socket.destroy();
+  } else {
+    socket.destroy();
+  }
 });
 
+/* =========================
+   Boot
+   ========================= */
 (async () => {
   try {
     await pool.connect();
