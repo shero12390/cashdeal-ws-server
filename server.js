@@ -7,6 +7,19 @@ const crypto = require("crypto");
 const { WebSocketServer } = require("ws");
 const { Pool } = require("pg");
 const jwt = require("jsonwebtoken");
+// Swagger / Express (for API docs)
+const express = require("express");
+const swaggerUi = require("swagger-ui-express");
+const YAML = require("yamljs");
+const path = require("path");
+
+const app = express();
+
+// load openapi.yaml from repo root
+const swaggerDoc = YAML.load(path.join(__dirname, "openapi.yaml"));
+
+// serve docs at /docs
+app.use("/docs", swaggerUi.serve, swaggerUi.setup(swaggerDoc));
 
 // ------------------ Config / Env ------------------
 const PORT = Number(process.env.PORT) || 3000;                 // << fixed port handling
@@ -196,49 +209,88 @@ function rateLimit(ip, limit = 60, windowMs = 60_000) {
   return rec.count <= limit;
 }
 
-// ------------------ WebSocket ------------------
-const server = http.createServer(async (req, res) => {
-  // (HTTP routes handled in Part 2)
-});
-const wss = new WebSocketServer({ server });
+// ------------------ WebSocket + HTTP (Express-attached) ------------------
+// Attach your Express app to the HTTP server so /docs and future REST routes work.
+const server = http.createServer(app);
 
-const subsByUser = new Map(); // userId -> Set(ws)
+// Create the WS server on the same HTTP server
+const wss = new WebSocketServer({ server, perMessageDeflate: false });
+
+// userId -> Set<ws>
+const subsByUser = new Map();
 
 function wsSend(ws, obj) {
-  try { ws.send(JSON.stringify(obj)); } catch {}
+  try { ws.send(JSON.stringify(obj)); } catch (_) {}
 }
+
+async function fetchBalance(uid) {
+  const r = await q(`SELECT balance FROM wallets WHERE user_id=$1`, [uid]);
+  return Number(r.rows[0]?.balance ?? 0);
+}
+
 function wsBroadcastBalance(userId, balance) {
   const subs = subsByUser.get(userId);
   if (!subs) return;
   for (const ws of subs) {
-    if (ws.readyState === ws.OPEN) wsSend(ws, { type: "balance.update", userId, balance });
+    if (ws.readyState === ws.OPEN) {
+      wsSend(ws, { type: "balance.update", userId, balance });
+    }
   }
 }
 
 wss.on("connection", (ws) => {
+  // Optional heartbeat (keeps connections from idling out)
+  ws.isAlive = true;
+  ws.on("pong", () => { ws.isAlive = true; });
+
   ws.on("message", async (buf) => {
-    let msg = null;
+    let msg;
     try { msg = JSON.parse(String(buf)); } catch { return; }
 
+    // Ping/Pong
     if (msg?.type === "ping") {
       return wsSend(ws, { type: "pong", ts: msg.ts || Date.now() });
     }
 
+    // Subscribe to balance updates for a user
     if (msg?.type === "subscribe.balance" && msg.userId) {
       const uid = String(msg.userId);
       if (!subsByUser.has(uid)) subsByUser.set(uid, new Set());
       subsByUser.get(uid).add(ws);
-      ws.on("close", () => { subsByUser.get(uid)?.delete(ws); });
+
+      ws.on("close", () => {
+        const set = subsByUser.get(uid);
+        if (set) { set.delete(ws); if (set.size === 0) subsByUser.delete(uid); }
+      });
+
       wsSend(ws, { type: "balance.subscribed", userId: uid });
-      // optional: send current balance now
+
+      // Send current balance immediately
       try {
-        const r = await q(`SELECT balance FROM wallets WHERE user_id=$1`, [uid]);
-        const bal = Number(r.rows[0]?.balance ?? 0);
+        const bal = await fetchBalance(uid);
         wsSend(ws, { type: "balance.update", userId: uid, balance: bal });
-      } catch {}
+      } catch (_) {}
     }
   });
 });
+
+// Heartbeat sweep (optional; cleans dead sockets)
+const HEARTBEAT_MS = 30000;
+setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (!ws.isAlive) return ws.terminate();
+    ws.isAlive = false;
+    try { ws.ping(); } catch {}
+  });
+}, HEARTBEAT_MS);
+
+// Start the combined HTTP+WS server (ensure this is called only once in the file)
+server.listen(PORT, () => {
+  console.log(`CashDeal server listening on :${PORT}`);
+});
+
+// Export broadcaster so your HTTP endpoints can push updates after DB writes
+module.exports = { wsBroadcastBalance };
 // ------------------ HTTP Router ------------------
 server.on("request", async (req, res) => {
   try {
