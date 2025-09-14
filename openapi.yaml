@@ -1,0 +1,175 @@
+openapi: 3.0.3
+info:
+  title: Cashdeal Matchmaking & Wallet API
+  version: "1.0.0"
+servers:
+  - url: https://api.cashdeal.space
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    ResultItem:
+      type: object
+      required: [userId, result]
+      properties:
+        userId:
+          type: string
+          format: uuid
+        result:
+          type: string
+          enum: [won, lost, draw, cancelled]
+    CreateRoomRequest:
+      type: object
+      required: [userId, game, stake, maxPlayers]
+      properties:
+        userId: { type: string, format: uuid }
+        game: { type: string }
+        stake: { type: number }
+        maxPlayers: { type: integer, minimum: 1 }
+        minPlayers: { type: integer, minimum: 1 }
+        mode: { type: string, enum: [solo, versus, pool], default: versus }
+        autostart: { type: boolean, default: true }
+        countdownSeconds: { type: integer, default: 5 }
+        require_mutual_ready: { type: boolean, default: true }
+        config: { type: object, additionalProperties: true }
+    JoinRoomRequest:
+      type: object
+      required: [roomId, userId]
+      properties:
+        roomId: { type: string }
+        userId: { type: string, format: uuid }
+    ReadyRequest:
+      type: object
+      required: [roomId, userId, ready]
+      properties:
+        roomId: { type: string }
+        userId: { type: string, format: uuid }
+        ready: { type: boolean }
+    RejoinRequest:
+      type: object
+      required: [roomId, userId]
+      properties:
+        roomId: { type: string }
+        userId: { type: string, format: uuid }
+    LeaveRequest:
+      type: object
+      required: [roomId, userId]
+      properties:
+        roomId: { type: string }
+        userId: { type: string, format: uuid }
+    FinishMatchRequest:
+      type: object
+      required: [matchId, results]
+      properties:
+        matchId: { type: string }
+        results:
+          type: array
+          items: { $ref: '#/components/schemas/ResultItem' }
+    WalletSyncRequest:
+      type: object
+      required: [uid, balance]
+      properties:
+        uid: { type: string, format: uuid }
+        balance: { type: string, description: "Decimal string, e.g. '774.00'" }
+
+security:
+  - bearerAuth: []
+
+paths:
+  /rooms/create:
+    post:
+      summary: Create a room
+      security: [ { bearerAuth: [] } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateRoomRequest' }
+      responses:
+        '200': { description: Room created }
+        '401': { description: Unauthorized }
+
+  /rooms/join:
+    post:
+      summary: Join a room
+      security: [ { bearerAuth: [] } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/JoinRoomRequest' }
+      responses:
+        '200': { description: Joined }
+        '401': { description: Unauthorized }
+
+  /rooms/ready:
+    post:
+      summary: Mark player ready (starts when all ready)
+      security: [ { bearerAuth: [] } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReadyRequest' }
+      responses:
+        '200': { description: Ready set }
+        '401': { description: Unauthorized }
+
+  /rooms/rejoin:
+    post:
+      summary: Rejoin within grace window (90s policy)
+      security: [ { bearerAuth: [] } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RejoinRequest' }
+      responses:
+        '200': { description: Rejoined }
+        '401': { description: Unauthorized }
+
+  /rooms/leave:
+    post:
+      summary: Leave room (no refund if live; sets grace)
+      security: [ { bearerAuth: [] } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LeaveRequest' }
+      responses:
+        '200': { description: Left }
+        '401': { description: Unauthorized }
+
+  /matches/finish:
+    post:
+      summary: Finish match (idempotent)
+      security: [ { bearerAuth: [] } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FinishMatchRequest' }
+      responses:
+        '200': { description: Settled }
+        '401': { description: Unauthorized }
+
+  /internal/wallet/sync:
+    post:
+      summary: Mirror Firebase-approved balance to game server
+      parameters:
+        - in: header
+          name: x-sync-secret
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WalletSyncRequest' }
+      responses:
+        '200': { description: Synced }
+        '401': { description: Unauthorized or bad secret }
