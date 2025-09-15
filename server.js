@@ -10,7 +10,7 @@ const swaggerUi = require("swagger-ui-express");
 const YAML = require("yamljs");
 const { WebSocketServer } = require("ws");
 const { Pool } = require("pg");
-const jwt = require("jsonwebtoken");
+const jwt = require("jsonwebtoken"); // Make sure this is installed
 
 /* -------------------- Config / Env -------------------- */
 const PORT = Number(process.env.PORT) || 3000;        // Render sets PORT
@@ -122,7 +122,6 @@ function requireAuth(req, res, next) {
     return res.status(401).json({ ok: false, error: "unauthorized" });
   }
 }
-
 /* -------------------- HMAC helpers for /internal/wallet/sync -------------------- */
 function safeTimingEqual(a, b) {
   const ab = Buffer.from(a); const bb = Buffer.from(b);
@@ -202,8 +201,8 @@ app.post("/internal/wallet/sync",
     }
   }
 );
-/* -------------------- Rooms & Matchmaking -------------------- */
 
+/* -------------------- Rooms & Matchmaking -------------------- */
 // Create a room
 app.post("/rooms/create", requireAuth, rateLimit(30, 60_000), async (req, res) => {
   try {
@@ -264,7 +263,6 @@ app.post("/rooms/ready", requireAuth, async (req, res) => {
     console.error(e); res.status(500).json({ ok: false, error: "db_error" });
   }
 });
-
 /* -------------------- Matches: finish (idempotent) -------------------- */
 async function getOrStoreIdempotent(key, route, responseJson) {
   const found = await q(`SELECT response FROM idempotency_keys WHERE key=$1`, [key]);
@@ -397,6 +395,7 @@ setInterval(() => {
     ws.isAlive = false; try { ws.ping(); } catch {}
   }
 }, 30_000);
+
 /* -------------------- Basic HTTP fallback (optional) -------------------- */
 // If you still want a very small plain HTTP route (not needed if using Express for all):
 app.get("/", (req, res) => {
