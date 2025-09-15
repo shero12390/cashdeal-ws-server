@@ -26,6 +26,8 @@ const pool = new Pool({
   connectionString: DB_URL,
   max: 10,
   idleTimeoutMillis: 30_000,
+  // REQUIRED on Render’s managed Postgres (external URL requires SSL)
+  ssl: { rejectUnauthorized: false }
 });
 pool.on("error", (err) => console.error("PG pool error:", err));
 
@@ -180,7 +182,10 @@ app.get("/wallet/me", requireAuth, async (req, res) => {
 app.post("/internal/wallet/sync",
   express.raw({ type: "*/*" }),  // raw body for HMAC
   async (req, res) => {
-    const raw = req.body?.toString("utf8") || "{}";
+    // If body was parsed by json() earlier, rebuild exact string for HMAC
+    const raw = Buffer.isBuffer(req.body)
+      ? req.body.toString("utf8")
+      : JSON.stringify(req.body || {});
     if (!verifyHmac(req, raw)) return res.status(401).json({ ok: false, error: "unauthorized" });
 
     let body; try { body = JSON.parse(raw); } catch { body = {}; }
