@@ -10,8 +10,8 @@ const swaggerUi = require("swagger-ui-express");
 const YAML = require("yamljs");
 const { WebSocketServer } = require("ws");
 const { Pool } = require("pg");
-const jwt = require("jsonwebtoken"); // Make sure this is installed
-const admin = require("firebase-admin"); // << NEW
+const jwt = require("jsonwebtoken");
+const admin = require("firebase-admin"); // Firebase Admin
 
 /* -------------------- Config / Env -------------------- */
 const PORT = Number(process.env.PORT) || 3000;        // Render sets PORT
@@ -23,7 +23,7 @@ const SYNC_SECRET = process.env.SYNC_SECRET || "superStrongSecret123";   // lega
 const SYNC_HMAC_KEY = process.env.SYNC_HMAC_KEY || "hmac_key_change_me"; // preferred
 
 /* -------------------- Firebase Admin init -------------------- */
-// Prefer GOOGLE_APPLICATION_CREDENTIALS on Render, else base64 service account JSON in FIREBASE_SERVICE_ACCOUNT
+// Prefer GOOGLE_APPLICATION_CREDENTIALS on Render, else base64 JSON in FIREBASE_SERVICE_ACCOUNT
 if (!admin.apps.length) {
   try {
     if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
@@ -32,8 +32,7 @@ if (!admin.apps.length) {
       const svcJson = JSON.parse(Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT, "base64").toString("utf8"));
       admin.initializeApp({ credential: admin.credential.cert(svcJson) });
     } else {
-      // Last resort (will fail verify if no credentials in env)
-      admin.initializeApp();
+      admin.initializeApp(); // last resort (will fail verify if no creds)
     }
     console.log("Firebase Admin initialized");
   } catch (e) {
@@ -71,7 +70,7 @@ async function migrate() {
     game text not null,
     stake numeric not null,
     max_players int not null default 2,
-    status text not null default 'waiting', -- waiting | ready | finished | cancelled
+    status text not null default 'waiting',
     created_at timestamptz not null default now(),
     expires_at timestamptz
   )`);
@@ -145,13 +144,12 @@ function requireAuth(req, res, next) {
   }
 }
 
-/* -------------------- NEW: /auth/firebase (exchange Firebase ID token -> server JWT) -------------------- */
+/* -------------------- /auth/firebase (exchange Firebase ID token -> server JWT) -------------------- */
 app.post("/auth/firebase", rateLimit(30, 60_000), async (req, res) => {
   try {
     const { idToken, uid, uid8 } = req.body || {};
     if (!idToken) return res.status(400).json({ ok: false, error: "missing_idToken" });
 
-    // Verify Firebase ID token
     let decoded;
     try {
       decoded = await admin.auth().verifyIdToken(idToken);
@@ -159,12 +157,10 @@ app.post("/auth/firebase", rateLimit(30, 60_000), async (req, res) => {
       return res.status(401).json({ ok: false, error: "invalid_firebase_token" });
     }
 
-    // Optional safety: if caller sent uid, ensure it matches the token's uid
     if (uid && String(uid) !== String(decoded.uid)) {
       return res.status(401).json({ ok: false, error: "uid_mismatch" });
     }
 
-    // Mint your own short-lived server JWT (what your API expects)
     const token = mintJwt({ uid: decoded.uid, uid8: uid8 || undefined });
     return res.json({ ok: true, token, ttl: TOKEN_TTL_SECONDS });
   } catch (e) {
@@ -180,7 +176,6 @@ function safeTimingEqual(a, b) {
   return crypto.timingSafeEqual(ab, bb);
 }
 function verifyHmac(req, rawBody) {
-  // Prefer X-Signature: sha256=<hex>, X-Timestamp: epoch ms
   const sig = req.headers["x-signature"];
   const ts = req.headers["x-timestamp"];
   if (sig && ts) {
@@ -189,7 +184,6 @@ function verifyHmac(req, rawBody) {
       .digest("hex");
     return safeTimingEqual(sig, `sha256=${expect}`);
   }
-  // Legacy x-sync-secret
   const legacy = req.headers["x-sync-secret"];
   return legacy && legacy === SYNC_SECRET;
 }
@@ -206,7 +200,6 @@ function asNumber(n, def = 0) {
 /* -------------------- Health & Dev Tokens -------------------- */
 app.get("/healthz", (req, res) => res.json({ ok: true, ts: Date.now() }));
 
-// Dev-only mint endpoint (protect behind Render env flag in prod)
 app.post("/auth/dev-mint", rateLimit(20, 60_000), (req, res) => {
   const { userId, name } = req.body || {};
   if (!userId) return res.status(400).json({ ok: false, error: "missing_userId" });
@@ -215,7 +208,6 @@ app.post("/auth/dev-mint", rateLimit(20, 60_000), (req, res) => {
 });
 
 /* -------------------- Wallet APIs -------------------- */
-// Get current user balance
 app.get("/wallet/me", requireAuth, async (req, res) => {
   try {
     const uid = req.user.uid;
@@ -227,11 +219,9 @@ app.get("/wallet/me", requireAuth, async (req, res) => {
   }
 });
 
-// Internal sync (Firebase->Core) with HMAC or legacy header
 app.post("/internal/wallet/sync",
-  express.raw({ type: "*/*" }),  // raw body for HMAC
+  express.raw({ type: "*/*" }),
   async (req, res) => {
-    // If body was parsed by json() earlier, rebuild exact string for HMAC
     const raw = Buffer.isBuffer(req.body)
       ? req.body.toString("utf8")
       : JSON.stringify(req.body || {});
@@ -247,7 +237,6 @@ app.post("/internal/wallet/sync",
         VALUES($1,$2,'USDT',now())
         ON CONFLICT (user_id) DO UPDATE SET balance=EXCLUDED.balance, updated_at=now()`,
         [uid, bal]);
-      // Broadcast over WS if anyone is listening
       try { wsBroadcastBalance(uid, bal); } catch {}
       res.json({ ok: true });
     } catch (e) {
@@ -257,7 +246,6 @@ app.post("/internal/wallet/sync",
 );
 
 /* -------------------- Rooms & Matchmaking -------------------- */
-// Create a room
 app.post("/rooms/create", requireAuth, rateLimit(30, 60_000), async (req, res) => {
   try {
     const { game, stake, maxPlayers = 2, ttlSeconds = 120 } = req.body || {};
@@ -270,7 +258,6 @@ app.post("/rooms/create", requireAuth, rateLimit(30, 60_000), async (req, res) =
              VALUES($1,$2,$3,$4,'waiting',$5)`,
       [id, String(game), asNumber(stake, 0), Number(maxPlayers) || 2, exp]);
 
-    // Auto-join creator
     await q(`INSERT INTO room_players(room_id, user_id) VALUES($1,$2)`, [id, req.user.uid]);
 
     res.json({ ok: true, roomId: id, status: "waiting", expiresAt: exp.toISOString() });
@@ -279,7 +266,6 @@ app.post("/rooms/create", requireAuth, rateLimit(30, 60_000), async (req, res) =
   }
 });
 
-// Join a room
 app.post("/rooms/join", requireAuth, rateLimit(60, 60_000), async (req, res) => {
   try {
     const { roomId } = req.body || {};
@@ -289,7 +275,6 @@ app.post("/rooms/join", requireAuth, rateLimit(60, 60_000), async (req, res) => 
     if (r.rowCount === 0) return res.status(404).json({ ok: false, error: "room_not_found" });
     if (r.rows[0].status !== "waiting") return res.status(400).json({ ok: false, error: "room_closed" });
 
-    // Insert ignore if already joined
     await q(`INSERT INTO room_players(room_id, user_id)
              VALUES($1,$2) ON CONFLICT DO NOTHING`, [roomId, req.user.uid]);
 
@@ -306,7 +291,6 @@ app.post("/rooms/join", requireAuth, rateLimit(60, 60_000), async (req, res) => 
   }
 });
 
-// Mark room ready (client hint) — optional
 app.post("/rooms/ready", requireAuth, async (req, res) => {
   try {
     const { roomId } = req.body || {};
@@ -317,6 +301,7 @@ app.post("/rooms/ready", requireAuth, async (req, res) => {
     console.error(e); res.status(500).json({ ok: false, error: "db_error" });
   }
 });
+
 /* -------------------- Matches: finish (idempotent) -------------------- */
 async function getOrStoreIdempotent(key, route, responseJson) {
   const found = await q(`SELECT response FROM idempotency_keys WHERE key=$1`, [key]);
@@ -333,16 +318,14 @@ app.post("/matches/finish", requireAuth, rateLimit(60, 60_000), async (req, res)
   const route = "matches.finish";
 
   try {
-    // If seen before, return stored response
     const prev = await q(`SELECT response FROM idempotency_keys WHERE key=$1`, [idem]);
     if (prev.rowCount) return res.json(prev.rows[0].response);
 
-    const { roomId, results } = payload; // results: [{ userId, result: won|lost|draw|cancelled }]
+    const { roomId, results } = payload; // [{ userId, result }]
     if (!roomId || !Array.isArray(results)) {
       return res.status(400).json({ ok: false, error: "bad_payload" });
     }
 
-    // Finish only once
     const r = await q(`UPDATE rooms SET status='finished' WHERE id=$1 AND status!='finished' RETURNING id`, [roomId]);
     if (r.rowCount === 0) {
       const resp = { ok: true, status: "already_finished" };
@@ -350,7 +333,6 @@ app.post("/matches/finish", requireAuth, rateLimit(60, 60_000), async (req, res)
       return res.json(stored);
     }
 
-    // Payout simple: +stake to winners, -stake to losers, 0 draw (customize as needed)
     const roomRow = await q(`SELECT stake FROM rooms WHERE id=$1`, [roomId]);
     const stake = asNumber(roomRow.rows[0]?.stake || 0);
 
@@ -360,7 +342,6 @@ app.post("/matches/finish", requireAuth, rateLimit(60, 60_000), async (req, res)
       let delta = 0;
       if (it.result === "won") delta = stake;
       else if (it.result === "lost") delta = -stake;
-      else delta = 0;
 
       if (delta !== 0) {
         await q(`INSERT INTO wallets(user_id, balance, currency, updated_at)
