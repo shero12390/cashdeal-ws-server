@@ -11,6 +11,7 @@ const YAML = require("yamljs");
 const { WebSocketServer } = require("ws");
 const { Pool } = require("pg");
 const jwt = require("jsonwebtoken"); // Make sure this is installed
+const admin = require("firebase-admin"); // << NEW
 
 /* -------------------- Config / Env -------------------- */
 const PORT = Number(process.env.PORT) || 3000;        // Render sets PORT
@@ -20,6 +21,25 @@ const TOKEN_TTL_SECONDS = Number(process.env.TOKEN_TTL_SECONDS || 3600);
 
 const SYNC_SECRET = process.env.SYNC_SECRET || "superStrongSecret123";   // legacy
 const SYNC_HMAC_KEY = process.env.SYNC_HMAC_KEY || "hmac_key_change_me"; // preferred
+
+/* -------------------- Firebase Admin init -------------------- */
+// Prefer GOOGLE_APPLICATION_CREDENTIALS on Render, else base64 service account JSON in FIREBASE_SERVICE_ACCOUNT
+if (!admin.apps.length) {
+  try {
+    if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+      admin.initializeApp(); // uses ADC
+    } else if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+      const svcJson = JSON.parse(Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT, "base64").toString("utf8"));
+      admin.initializeApp({ credential: admin.credential.cert(svcJson) });
+    } else {
+      // Last resort (will fail verify if no credentials in env)
+      admin.initializeApp();
+    }
+    console.log("Firebase Admin initialized");
+  } catch (e) {
+    console.warn("Firebase Admin init warning:", e.message);
+  }
+}
 
 /* -------------------- DB Pool -------------------- */
 const pool = new Pool({
@@ -124,6 +144,35 @@ function requireAuth(req, res, next) {
     return res.status(401).json({ ok: false, error: "unauthorized" });
   }
 }
+
+/* -------------------- NEW: /auth/firebase (exchange Firebase ID token -> server JWT) -------------------- */
+app.post("/auth/firebase", rateLimit(30, 60_000), async (req, res) => {
+  try {
+    const { idToken, uid, uid8 } = req.body || {};
+    if (!idToken) return res.status(400).json({ ok: false, error: "missing_idToken" });
+
+    // Verify Firebase ID token
+    let decoded;
+    try {
+      decoded = await admin.auth().verifyIdToken(idToken);
+    } catch (e) {
+      return res.status(401).json({ ok: false, error: "invalid_firebase_token" });
+    }
+
+    // Optional safety: if caller sent uid, ensure it matches the token's uid
+    if (uid && String(uid) !== String(decoded.uid)) {
+      return res.status(401).json({ ok: false, error: "uid_mismatch" });
+    }
+
+    // Mint your own short-lived server JWT (what your API expects)
+    const token = mintJwt({ uid: decoded.uid, uid8: uid8 || undefined });
+    return res.json({ ok: true, token, ttl: TOKEN_TTL_SECONDS });
+  } catch (e) {
+    console.error("/auth/firebase error:", e);
+    return res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
 /* -------------------- HMAC helpers for /internal/wallet/sync -------------------- */
 function safeTimingEqual(a, b) {
   const ab = Buffer.from(a); const bb = Buffer.from(b);
@@ -402,7 +451,6 @@ setInterval(() => {
 }, 30_000);
 
 /* -------------------- Basic HTTP fallback (optional) -------------------- */
-// If you still want a very small plain HTTP route (not needed if using Express for all):
 app.get("/", (req, res) => {
   res.type("text/plain").send("CashDeal WS/HTTP server OK. See /docs for API.");
 });
