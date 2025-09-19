@@ -18,6 +18,8 @@ const PORT = Number(process.env.PORT) || 3000;        // Render sets PORT
 const DB_URL = process.env.DB_URL;
 const AUTH_JWT_SECRET = process.env.AUTH_JWT_SECRET || "dev_secret_change_me";
 const TOKEN_TTL_SECONDS = Number(process.env.TOKEN_TTL_SECONDS || 3600);
+// NEW: short-lived guest token TTL (~15 minutes default)
+const GUEST_TOKEN_TTL_SECONDS = Number(process.env.GUEST_TOKEN_TTL_SECONDS || 900);
 
 const SYNC_SECRET = process.env.SYNC_SECRET || "superStrongSecret123";   // legacy
 const SYNC_HMAC_KEY = process.env.SYNC_HMAC_KEY || "hmac_key_change_me"; // preferred
@@ -143,6 +145,20 @@ function requireAuth(req, res, next) {
     return res.status(401).json({ ok: false, error: "unauthorized" });
   }
 }
+// NEW: allow either normal server JWT (no scope) or guest JWT with scope=match
+function requireMatchAuth(req, res, next) {
+  try {
+    const user = verifyJwtFromReq(req);
+    // Accept tokens minted by /auth/firebase (no scope) OR guest with scope=match
+    if (user.scope && user.scope !== "match") {
+      return res.status(403).json({ ok: false, error: "forbidden_scope" });
+    }
+    req.user = user;
+    next();
+  } catch (e) {
+    return res.status(401).json({ ok: false, error: "unauthorized" });
+  }
+}
 
 /* -------------------- /auth/firebase (exchange Firebase ID token -> server JWT) -------------------- */
 app.post("/auth/firebase", rateLimit(30, 60_000), async (req, res) => {
@@ -165,6 +181,30 @@ app.post("/auth/firebase", rateLimit(30, 60_000), async (req, res) => {
     return res.json({ ok: true, token, ttl: TOKEN_TTL_SECONDS });
   } catch (e) {
     console.error("/auth/firebase error:", e);
+    return res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+/* -------------------- NEW: /auth/guest (short-lived, matchmaking-only JWT) -------------------- */
+app.post("/auth/guest", rateLimit(30, 60_000), async (req, res) => {
+  try {
+    const { uid = "", uid8 = "", device = "", appVer = "" } = req.body || {};
+    // Minimal sanity: must provide at least uid8 (your client can compute 8-digit ID)
+    if (!uid8 || String(uid8).trim().length === 0) {
+      return res.status(400).json({ ok: false, error: "missing_uid8" });
+    }
+    // Mint guest token restricted to matchmaking scope
+    const payload = {
+      uid: uid || undefined,
+      uid8: String(uid8),
+      scope: "match",
+      dev: device ? String(device).slice(0, 64) : undefined,
+      ver: appVer ? String(appVer).slice(0, 32) : undefined
+    };
+    const token = mintJwt(payload, GUEST_TOKEN_TTL_SECONDS);
+    return res.json({ ok: true, token, ttl: GUEST_TOKEN_TTL_SECONDS, expMs: GUEST_TOKEN_TTL_SECONDS * 1000 });
+  } catch (e) {
+    console.error("/auth/guest error:", e);
     return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
@@ -206,7 +246,6 @@ app.post("/auth/dev-mint", rateLimit(20, 60_000), (req, res) => {
   const token = mintJwt({ uid: userId, name: name || "Guest" });
   res.json({ ok: true, token, ttl: TOKEN_TTL_SECONDS });
 });
-
 /* -------------------- Wallet APIs -------------------- */
 app.get("/wallet/me", requireAuth, async (req, res) => {
   try {
@@ -246,7 +285,7 @@ app.post("/internal/wallet/sync",
 );
 
 /* -------------------- Rooms & Matchmaking -------------------- */
-app.post("/rooms/create", requireAuth, rateLimit(30, 60_000), async (req, res) => {
+app.post("/rooms/create", requireMatchAuth, rateLimit(30, 60_000), async (req, res) => {
   try {
     const { game, stake, maxPlayers = 2, ttlSeconds = 120 } = req.body || {};
     if (!game) return res.status(400).json({ ok: false, error: "missing_game" });
@@ -266,7 +305,7 @@ app.post("/rooms/create", requireAuth, rateLimit(30, 60_000), async (req, res) =
   }
 });
 
-app.post("/rooms/join", requireAuth, rateLimit(60, 60_000), async (req, res) => {
+app.post("/rooms/join", requireMatchAuth, rateLimit(60, 60_000), async (req, res) => {
   try {
     const { roomId } = req.body || {};
     if (!roomId) return res.status(400).json({ ok: false, error: "missing_roomId" });
@@ -291,7 +330,7 @@ app.post("/rooms/join", requireAuth, rateLimit(60, 60_000), async (req, res) => 
   }
 });
 
-app.post("/rooms/ready", requireAuth, async (req, res) => {
+app.post("/rooms/ready", requireMatchAuth, async (req, res) => {
   try {
     const { roomId } = req.body || {};
     if (!roomId) return res.status(400).json({ ok: false, error: "missing_roomId" });
@@ -311,7 +350,7 @@ async function getOrStoreIdempotent(key, route, responseJson) {
   return responseJson;
 }
 
-app.post("/matches/finish", requireAuth, rateLimit(60, 60_000), async (req, res) => {
+app.post("/matches/finish", requireMatchAuth, rateLimit(60, 60_000), async (req, res) => {
   const idem = String(req.headers["idempotency-key"] || "");
   if (!idem) return res.status(400).json({ ok: false, error: "missing_idempotency_key" });
   const payload = req.body || {};
